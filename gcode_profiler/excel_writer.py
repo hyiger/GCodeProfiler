@@ -9,6 +9,7 @@ from openpyxl.chart.label import DataLabelList
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.drawing.text import RichText, Paragraph, ParagraphProperties, CharacterProperties
 
 from .stats import weighted_quantile, make_bins, bin_counts
 from .gcode_parser import filament_area_mm2
@@ -730,6 +731,18 @@ def write_xlsx(
     # We'll set the skip factor after deciding the dashboard layout.
     label_skip = 1
 
+    def _axis_font(size_pt: float) -> RichText:
+        """Create a RichText object that sets axis tick label font size.
+
+        openpyxl doesn't expose a simple `font` property for axis tick labels.
+        Setting `axis.txPr` with a RichText paragraph is the most reliable
+        cross-platform way to control tick label size.
+        """
+        # Excel stores font size in 1/100 pt.
+        sz = int(round(size_pt * 100))
+        ppr = ParagraphProperties(defRPr=CharacterProperties(sz=sz))
+        return RichText(p=[Paragraph(pPr=ppr)])
+
     def _style_axis(axis):
         # Force axis + tick labels to be shown.
         # Excel can sometimes hide tick labels if an axis is considered unused.
@@ -738,6 +751,12 @@ def write_xlsx(
         # Tick marks help readability.
         axis.majorTickMark = "out"
         axis.minorTickMark = "none"
+        # Ensure tick label font is readable and doesn't balloon.
+        # 10pt is a good default for Y-axis.
+        try:
+            axis.txPr = _axis_font(10)
+        except Exception:
+            pass
         return axis
 
     def _style_x_axis(axis):
@@ -746,6 +765,11 @@ def write_xlsx(
         axis.tickLblSkip = label_skip
         axis.tickMarkSkip = label_skip
         axis.textRotation = 45
+        # Slightly smaller font on x-axis tick labels.
+        try:
+            axis.txPr = _axis_font(9)
+        except Exception:
+            pass
         return axis
 
     def add_line_chart(title, y_title, min_col, anchor, width=13, height=7, max_col=None, extra_series_cols=None):
