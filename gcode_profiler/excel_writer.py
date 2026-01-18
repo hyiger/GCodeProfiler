@@ -1,0 +1,949 @@
+import math
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import Alignment, PatternFill
+from openpyxl.utils import get_column_letter
+
+from .stats import weighted_quantile, make_bins, bin_counts
+from .gcode_parser import filament_area_mm2
+from .config_ini import _ini_value_to_float
+
+def set_basic_column_widths(ws, widths):
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+
+def write_xlsx(
+    moves,
+    layer_z_map,
+    out_path: str,
+    bins: int,
+    include_legends: bool,
+    per_layer_only: bool,
+    top_n_slowest: int,
+    filament_diameter_mm: float,
+    filament_density_g_cm3: float,
+    config_info: dict | None = None,
+    layout: str = "compact",
+    compare_moves=None,
+    compare_layer_z_map=None,
+    compare_label: str | None = None,
+    status_cb=None,
+):
+    def _status(msg: str):
+        if status_cb is not None:
+            status_cb(msg)
+
+    _status("Creating workbook")
+    wb = Workbook()
+
+    # Geometry for filament usage calculations
+    area_mm2 = filament_area_mm2(float(filament_diameter_mm))
+
+    # Dashboard (first sheet)
+    ws_dash = wb.active
+    ws_dash.title = "Dashboard"
+
+    # Moves sheet
+    ws_moves = wb.create_sheet("Moves")
+
+    _status("Populating Moves")
+
+    headers = [
+        "layer",
+        "z",
+        "type",
+        "cmd",
+        "x0",
+        "y0",
+        "z0",
+        "x1",
+        "y1",
+        "z1",
+        "dist_mm",
+        "de_mm",
+        "time_s",
+        "speed_mm_s",
+        "flow_mm3_s",
+        "fan_pct",
+        "hotend_C",
+        "bed_C",
+        "chamber_C",
+    ]
+
+    ws_moves.append(headers)
+
+    if not per_layer_only:
+        for m in moves:
+            ws_moves.append([m.get(h) for h in headers])
+
+    for cell in ws_moves["C"]:
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+    set_basic_column_widths(
+        ws_moves,
+        {
+            "A": 8,
+            "B": 10,
+            "C": 30,
+            "D": 6,
+            "K": 12,
+            "L": 12,
+            "M": 10,
+            "N": 12,
+            "O": 12,
+            "P": 10,
+        },
+    )
+
+    # Layers sheet
+    ws_layers = wb.create_sheet("Layers")
+
+    _status("Aggregating per-layer metrics")
+    ws_layers.append(
+        [
+            "layer",
+            "z_mm",
+            "layer_height_mm",
+            "time_s",
+            "dist_mm",
+            "extrusion_mm",
+            "avg_speed_mm_s",
+            "avg_flow_mm3_s",
+            "peak_speed_mm_s",
+            "p95_speed_mm_s",
+            "peak_flow_mm3_s",
+            "p95_flow_mm3_s",
+            "over_flow_time_pct",
+            "over_speed_time_pct",
+            "avg_fan_pct",
+            "hotend_set_C",
+            "bed_set_C",
+            "chamber_set_C",
+        ]
+    )
+
+    by_layer = defaultdict(list)
+    for m in moves:
+        by_layer[m["layer"]].append(m)
+
+    layers_sorted = sorted(by_layer.keys())
+    prev_z = None
+
+    # Track last known setpoints per layer for cleaner charts
+    last_hotend = None
+    last_bed = None
+    last_chamber = None
+
+    for L in layers_sorted:
+        ms = by_layer[L]
+        z_val = layer_z_map.get(L, ms[-1]["z"])
+        layer_h = (z_val - prev_z) if (prev_z is not None and z_val is not None) else None
+        if z_val is not None:
+            prev_z = z_val
+
+        t = sum(m["time_s"] for m in ms)
+        d = sum(m["dist_mm"] for m in ms)
+        e = sum(m["de_mm"] for m in ms)
+
+        # Per-layer worst-case / percentile metrics (tuning-oriented)
+        sp_vals = [m["speed_mm_s"] for m in ms if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+        sp_w = [m["time_s"] for m in ms if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+        fl_vals = [m["flow_mm3_s"] for m in ms if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
+        fl_w = [m["time_s"] for m in ms if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
+
+        peak_speed = max(sp_vals) if sp_vals else None
+        p95_speed = weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None
+        peak_flow = max(fl_vals) if fl_vals else None
+        p95_flow = weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None
+
+        flow_limit = (config_info or {}).get("filament_max_volumetric_speed")
+        speed_limit = (config_info or {}).get("max_print_speed")
+        over_flow_pct = None
+        over_speed_pct = None
+        if t and t > 0:
+            if flow_limit is not None:
+                try:
+                    fl_lim = float(flow_limit)
+                    over_t = sum(m["time_s"] for m in ms if (m.get("flow_mm3_s") or 0) > fl_lim)
+                    over_flow_pct = over_t / t
+                except Exception:
+                    pass
+            if speed_limit is not None:
+                try:
+                    sp_lim = float(speed_limit)
+                    over_t = sum(m["time_s"] for m in ms if (m.get("speed_mm_s") or 0) > sp_lim)
+                    over_speed_pct = over_t / t
+                except Exception:
+                    pass
+
+        if t > 0:
+            avg_speed = d / t
+            avg_flow = sum(m["flow_mm3_s"] * m["time_s"] for m in ms) / t
+            fan_pairs = [(m["fan_pct"], m["time_s"]) for m in ms if m["fan_pct"] is not None]
+            avg_fan = (sum(v * w for v, w in fan_pairs) / sum(w for _, w in fan_pairs)) if fan_pairs else None
+        else:
+            avg_speed = None
+            avg_flow = None
+            avg_fan = None
+
+        for m in ms:
+            if m["hotend_C"] is not None:
+                last_hotend = m["hotend_C"]
+            if m["bed_C"] is not None:
+                last_bed = m["bed_C"]
+            if m["chamber_C"] is not None:
+                last_chamber = m["chamber_C"]
+
+        ws_layers.append([
+            L,
+            z_val,
+            layer_h,
+            t,
+            d,
+            e,
+            avg_speed,
+            avg_flow,
+            peak_speed,
+            p95_speed,
+            peak_flow,
+            p95_flow,
+            over_flow_pct,
+            over_speed_pct,
+            avg_fan,
+            last_hotend,
+            last_bed,
+            last_chamber,
+        ])
+
+    # Optional reference columns from config.ini (used for nicer chart scaling / reference lines)
+    if config_info:
+        ref_flow = config_info.get('filament_max_volumetric_speed')
+        ref_speed = config_info.get('max_print_speed')
+        ref_lh_max = config_info.get('max_layer_height')
+
+        # Add columns only if at least one reference value exists
+        if any(v is not None for v in (ref_flow, ref_speed, ref_lh_max)):
+            base_cols = ws_layers.max_column
+            # Headers
+            if ref_flow is not None:
+                ws_layers.cell(row=1, column=base_cols + 1, value='ref_flow_max_mm3_s')
+                for r in range(2, ws_layers.max_row + 1):
+                    ws_layers.cell(row=r, column=base_cols + 1, value=float(ref_flow))
+                base_cols += 1
+            if ref_speed is not None:
+                ws_layers.cell(row=1, column=base_cols + 1, value='ref_speed_max_mm_s')
+                for r in range(2, ws_layers.max_row + 1):
+                    ws_layers.cell(row=r, column=base_cols + 1, value=float(ref_speed))
+                base_cols += 1
+            if ref_lh_max is not None:
+                ws_layers.cell(row=1, column=base_cols + 1, value='ref_layerheight_max_mm')
+                for r in range(2, ws_layers.max_row + 1):
+                    ws_layers.cell(row=r, column=base_cols + 1, value=float(ref_lh_max))
+                base_cols += 1
+
+    set_basic_column_widths(
+        ws_layers,
+        {
+            "A": 8,
+            "B": 10,
+            "C": 16,
+            "D": 12,
+            "E": 12,
+            "F": 14,
+            "G": 16,
+            "H": 16,
+            "I": 16,
+            "J": 16,
+            "K": 16,
+            "L": 16,
+            "M": 16,
+            "N": 16,
+            "O": 12,
+            "P": 14,
+            "Q": 12,
+            "R": 12,
+        },
+    )
+
+    # Nice-to-have: conditional formatting for outliers (useful at-a-glance).
+    # These are driven by --config (or explicit CLI overrides) when available.
+    if config_info:
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+
+        max_flow = config_info.get('filament_max_volumetric_speed')
+        max_speed = config_info.get('max_print_speed')
+        max_lh = config_info.get('max_layer_height')
+        min_lh = config_info.get('min_layer_height')
+
+        last = ws_layers.max_row
+        # Avg speed (col G)
+        if max_speed is not None:
+            ws_layers.conditional_formatting.add(
+                f"G2:G{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_speed))], fill=yellow_fill)
+            )
+            # Peak/P95 speed
+            ws_layers.conditional_formatting.add(
+                f"I2:I{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_speed))], fill=yellow_fill)
+            )
+            ws_layers.conditional_formatting.add(
+                f"J2:J{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_speed))], fill=yellow_fill)
+            )
+        # Avg flow (col H)
+        if max_flow is not None:
+            ws_layers.conditional_formatting.add(
+                f"H2:H{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_flow))], fill=red_fill)
+            )
+            # Peak/P95 flow
+            ws_layers.conditional_formatting.add(
+                f"K2:K{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_flow))], fill=red_fill)
+            )
+            ws_layers.conditional_formatting.add(
+                f"L2:L{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_flow))], fill=red_fill)
+            )
+        # Layer height bounds (col C)
+        if max_lh is not None:
+            ws_layers.conditional_formatting.add(
+                f"C2:C{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_lh))], fill=yellow_fill)
+            )
+        if min_lh is not None:
+            ws_layers.conditional_formatting.add(
+                f"C2:C{last}",
+                CellIsRule(operator='lessThan', formula=[str(float(min_lh))], fill=yellow_fill)
+            )
+
+    # Legends
+    def add_legend_sheet(name, values, unit_label, forced_min=None, forced_max=None):
+        ws = wb.create_sheet(name)
+        clean = [v for v in values if v is not None]
+        if not clean:
+            ws.append(["No data"])
+            return ws
+        vmin, vmax = min(clean), max(clean)
+        if forced_min is not None:
+            try:
+                vmin = float(forced_min)
+            except Exception:
+                pass
+        if forced_max is not None:
+            try:
+                vmax = float(forced_max)
+            except Exception:
+                pass
+        if vmax < vmin:
+            vmin, vmax = vmax, vmin
+        ws.append(["min", vmin])
+        ws.append(["max", vmax])
+        ws.append([])
+        ws.append(["bin", f"range ({unit_label})", "count"])
+        bins_spec = make_bins(vmin, vmax, bins)
+        counts = bin_counts(clean, bins_spec)
+        for i, ((lo, hi), c) in enumerate(zip(bins_spec, counts), start=1):
+            ws.append([i, f"{lo:.6g} – {hi:.6g}", c])
+        set_basic_column_widths(ws, {"A": 8, "B": 24, "C": 10})
+        return ws
+
+    _status("Building legend sheets")
+    if include_legends:
+        speeds = [m["speed_mm_s"] for m in moves if m["speed_mm_s"] is not None and m["dist_mm"] > 0]
+        flows = [m["flow_mm3_s"] for m in moves if m["flow_mm3_s"] is not None and m["flow_mm3_s"] > 0]
+        fans = [m["fan_pct"] for m in moves if m["fan_pct"] is not None]
+        hotends = [m["hotend_C"] for m in moves if m["hotend_C"] is not None]
+        beds = [m["bed_C"] for m in moves if m["bed_C"] is not None]
+
+        layer_heights = []
+        for row in ws_layers.iter_rows(min_row=2, values_only=True):
+            lh = row[2]
+            if lh is not None and lh > 0:
+                layer_heights.append(lh)
+
+        add_legend_sheet("Legend_Speed", speeds, "mm/s", forced_min=0, forced_max=(config_info or {}).get("max_print_speed"))
+        add_legend_sheet("Legend_Flow_mm3s", flows, "mm³/s", forced_min=0, forced_max=(config_info or {}).get("filament_max_volumetric_speed"))
+        add_legend_sheet("Legend_Fan_pct", fans, "%")
+        add_legend_sheet("Legend_Temp_C", hotends, "°C")
+        add_legend_sheet("Legend_Bed_C", beds, "°C")
+        add_legend_sheet("Legend_LayerHeight_mm", layer_heights, "mm", forced_min=(config_info or {}).get("min_layer_height"), forced_max=(config_info or {}).get("max_layer_height"))
+        ws_ft = wb.create_sheet("Legend_FeatureType")
+        c = Counter(m["type"] for m in moves if m.get("type"))
+
+        # Totals for percentages + filament usage
+        total_time_s = sum(m.get("time_s", 0.0) or 0.0 for m in moves)
+        total_de_mm = sum(m.get("de_mm", 0.0) or 0.0 for m in moves if (m.get("de_mm", 0.0) or 0.0) > 0)
+
+        # Excel stores time as days. We'll store time as days and format as [h]:mm:ss
+        ws_ft.append(["Feature type", "Time", "Percentage", "Used filament (m)", "Used filament (g)", "Move count"])
+
+        for t, n in c.most_common():
+            ms = [m for m in moves if m.get("type") == t]
+            time_s = sum(m.get("time_s", 0.0) or 0.0 for m in ms)
+            de_mm = sum((m.get("de_mm", 0.0) or 0.0) for m in ms if (m.get("de_mm", 0.0) or 0.0) > 0)
+
+            # Percentage of total time
+            pct = (time_s / total_time_s) if total_time_s > 0 else 0.0
+
+            used_m = de_mm / 1000.0
+
+            # grams = volume_cm3 * density_g_cm3
+            vol_mm3 = de_mm * area_mm2
+            vol_cm3 = vol_mm3 / 1000.0
+            used_g = vol_cm3 * float(filament_density_g_cm3)
+
+            ws_ft.append([
+                t,
+                time_s / 86400.0,
+                pct,
+                used_m,
+                used_g,
+                n,
+            ])
+
+        # Formatting
+        for cell in ws_ft["A"]:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        for cell in ws_ft["B"][1:]:
+            cell.number_format = "[h]:mm:ss"
+        for cell in ws_ft["C"][1:]:
+            cell.number_format = "0.0%"
+        for cell in ws_ft["D"][1:]:
+            cell.number_format = "0.00"
+        for cell in ws_ft["E"][1:]:
+            cell.number_format = "0.00"
+
+        set_basic_column_widths(ws_ft, {"A": 34, "B": 12, "C": 12, "D": 16, "E": 16, "F": 12})
+
+        # Feature-type flow/speed limits summary (tuning-focused)
+        ws_ff = wb.create_sheet("FeatureType_Flow")
+        ws_ff.append([
+            "Feature type",
+            "Time",
+            "Time %",
+            "Used filament (m)",
+            "Used filament (g)",
+            "Peak speed (mm/s)",
+            "P95 speed (mm/s)",
+            "Peak flow (mm³/s)",
+            "P95 flow (mm³/s)",
+            "Over flow limit % time",
+            "Over speed limit % time",
+            "Move count",
+        ])
+
+        flow_limit = (config_info or {}).get("filament_max_volumetric_speed")
+        speed_limit = (config_info or {}).get("max_print_speed")
+        try:
+            flow_limit_f = float(flow_limit) if flow_limit is not None else None
+        except Exception:
+            flow_limit_f = None
+        try:
+            speed_limit_f = float(speed_limit) if speed_limit is not None else None
+        except Exception:
+            speed_limit_f = None
+
+        for t, n in c.most_common():
+            ms = [m for m in moves if m.get("type") == t]
+            time_s = sum(m.get("time_s", 0.0) or 0.0 for m in ms)
+            de_mm = sum((m.get("de_mm", 0.0) or 0.0) for m in ms if (m.get("de_mm", 0.0) or 0.0) > 0)
+            pct = (time_s / total_time_s) if total_time_s > 0 else 0.0
+            used_m = de_mm / 1000.0
+            vol_cm3 = (de_mm * area_mm2) / 1000.0
+            used_g = vol_cm3 * float(filament_density_g_cm3)
+
+            sp_vals = [m["speed_mm_s"] for m in ms if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+            sp_w = [m["time_s"] for m in ms if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+            fl_vals = [m["flow_mm3_s"] for m in ms if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
+            fl_w = [m["time_s"] for m in ms if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
+
+            peak_speed = max(sp_vals) if sp_vals else None
+            p95_speed = weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None
+            peak_flow = max(fl_vals) if fl_vals else None
+            p95_flow = weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None
+
+            over_flow_pct = None
+            over_speed_pct = None
+            if time_s and time_s > 0:
+                if flow_limit_f is not None:
+                    over_t = sum(m.get("time_s", 0.0) or 0.0 for m in ms if (m.get("flow_mm3_s") or 0) > flow_limit_f)
+                    over_flow_pct = over_t / time_s
+                if speed_limit_f is not None:
+                    over_t = sum(m.get("time_s", 0.0) or 0.0 for m in ms if (m.get("speed_mm_s") or 0) > speed_limit_f)
+                    over_speed_pct = over_t / time_s
+
+            ws_ff.append([
+                t,
+                time_s / 86400.0,
+                pct,
+                used_m,
+                used_g,
+                peak_speed,
+                p95_speed,
+                peak_flow,
+                p95_flow,
+                over_flow_pct,
+                over_speed_pct,
+                n,
+            ])
+
+        for cell in ws_ff["A"]:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        for cell in ws_ff["B"][1:]:
+            cell.number_format = "[h]:mm:ss"
+        for col in ("C", "J", "K"):
+            for cell in ws_ff[col][1:]:
+                cell.number_format = "0.0%"
+        for col in ("D", "E"):
+            for cell in ws_ff[col][1:]:
+                cell.number_format = "0.00"
+        for col in ("F", "G", "H", "I"):
+            for cell in ws_ff[col][1:]:
+                cell.number_format = "0.00"
+
+        set_basic_column_widths(ws_ff, {"A": 34, "B": 12, "C": 10, "D": 16, "E": 16, "F": 16, "G": 16, "H": 16, "I": 16, "J": 18, "K": 18, "L": 12})
+
+    # Top N slowest layers
+    ws_top = wb.create_sheet("Top_Slowest_Layers")
+    ws_top.append(["rank", "layer", "time_s", "z_mm", "avg_speed_mm_s", "avg_flow_mm3_s", "avg_fan_pct", "hotend_set_C", "bed_set_C", "chamber_set_C"])
+
+    layer_rows = []
+    for r in ws_layers.iter_rows(min_row=2, values_only=True):
+        # row: layer, z, lh, time, dist, extrusion, avg_speed, avg_flow, peak_speed, p95_speed,
+        #      peak_flow, p95_flow, over_flow_pct, over_speed_pct, avg_fan, hotend, bed, chamber
+        layer_rows.append(r)
+
+    layer_rows_sorted = sorted(layer_rows, key=lambda r: (r[3] if r[3] is not None else -1), reverse=True)
+    top_n = max(1, int(top_n_slowest))
+    for i, r in enumerate(layer_rows_sorted[:top_n], start=1):
+        ws_top.append([i, r[0], r[3], r[1], r[6], r[7], r[14], r[15], r[16], r[17]])
+
+    set_basic_column_widths(ws_top, {"A": 6, "B": 8, "C": 12, "D": 10, "E": 16, "F": 16, "G": 12, "H": 14, "I": 12, "J": 12})
+
+    _status("Building Dashboard")
+    # Dashboard charts (on first sheet)
+    # Excel column letters go A..Z, AA.. etc. Using chr() past 'Z' becomes '[' and breaks openpyxl.
+    # Make enough columns available so we can anchor a true two-column dashboard
+    # with plenty of horizontal separation (Excel chart bounding boxes can be wider
+    # than expected on some platforms/zoom levels).
+    ws_dash["A1"] = "Dashboard (charts are generated from Layers / Legend_* / Top_Slowest_Layers)."
+
+    # Config summary (optional)
+    if config_info:
+        ws_dash["B1"] = "Config summary"
+        pairs = [
+            ("Nozzle (mm)", config_info.get("nozzle_diameter")),
+            ("Filament (mm)", config_info.get("filament_diameter")),
+            ("Density (g/cm³)", config_info.get("filament_density")),
+            ("Max volumetric (mm³/s)", config_info.get("filament_max_volumetric_speed")),
+            ("Max print speed (mm/s)", config_info.get("max_print_speed")),
+            ("Layer height (mm)", config_info.get("layer_height")),
+            ("First layer (mm)", config_info.get("first_layer_height")),
+        ]
+        row = 2
+        for k, v in pairs:
+            if v is None:
+                continue
+            ws_dash[f"G{row}"] = k
+            ws_dash[f"H{row}"] = float(v)
+            row += 1
+        set_basic_column_widths(ws_dash, {"G": 22, "H": 18})
+
+    # Feature type legend table (similar to PrusaSlicer UI)
+    if include_legends and "Legend_FeatureType" in wb.sheetnames:
+        ws_dash["B2"] = "Feature type"
+        ws_dash["C2"] = "Time"
+        ws_dash["D2"] = "Percentage"
+        ws_dash["E2"] = "Used filament (m)"
+        ws_dash["F2"] = "Used filament (g)"
+
+        # Copy top feature types (by time) from Legend_FeatureType
+        ws_ft = wb["Legend_FeatureType"]
+        # Data starts at row 2
+        # Sort by time (column B) descending
+        rows = []
+        for r in ws_ft.iter_rows(min_row=2, values_only=True):
+            rows.append(r)
+        rows.sort(key=lambda r: (r[1] if r and r[1] is not None else 0), reverse=True)
+        max_rows = min(10, len(rows))
+        for i in range(max_rows):
+            r = rows[i]
+            out_row = 3 + i
+            ws_dash[f"B{out_row}"] = r[0]
+            ws_dash[f"C{out_row}"] = r[1]
+            ws_dash[f"D{out_row}"] = r[2]
+            ws_dash[f"E{out_row}"] = r[3]
+            ws_dash[f"F{out_row}"] = r[4]
+            ws_dash[f"C{out_row}"].number_format = "[h]:mm:ss"
+            ws_dash[f"D{out_row}"].number_format = "0.0%"
+            ws_dash[f"E{out_row}"].number_format = "0.00"
+            ws_dash[f"F{out_row}"].number_format = "0.00"
+
+        set_basic_column_widths(ws_dash, {"A": 3, "B": 28, "C": 12, "D": 12, "E": 18, "F": 18})
+
+
+    max_layer_row = ws_layers.max_row
+
+    # Locate optional reference columns in Layers (if config was provided)
+    ref_cols = {}
+    header_row = [c.value for c in ws_layers[1]]
+    for idx, name in enumerate(header_row, start=1):
+        if name in ("ref_flow_max_mm3_s", "ref_speed_max_mm_s", "ref_layerheight_max_mm"):
+            ref_cols[name] = idx
+    cats_layers = Reference(ws_layers, min_col=1, min_row=2, max_row=max_layer_row)
+
+    # NOTE: openpyxl chart sizes are in "Excel" units (roughly inches).
+    # Keep charts modest and place them with generous spacing to avoid overlap.
+    # NOTE: Chart object sizes are in "Excel units" (roughly inches). Excel's
+    # rendered bounding boxes can be larger than you'd expect, so we keep charts
+    # relatively small and leave generous horizontal/vertical gaps.
+    # Reduce label clutter: skip most x labels and rotate the remainder.
+    # Keep a floor of 1 (show everything) for short prints.
+    # We'll set the skip factor after deciding the dashboard layout.
+    label_skip = 1
+
+    def _style_axis(axis):
+        # Force axis + tick labels to be shown.
+        # Excel can sometimes hide tick labels if an axis is considered unused.
+        axis.delete = False
+        axis.tickLblPos = "nextTo"
+        # Tick marks help readability.
+        axis.majorTickMark = "out"
+        axis.minorTickMark = "none"
+        return axis
+
+    def _style_x_axis(axis):
+        _style_axis(axis)
+        # Reduce clutter for long category axes (hundreds of layers)
+        axis.tickLblSkip = label_skip
+        axis.tickMarkSkip = label_skip
+        axis.textRotation = 45
+        return axis
+
+    def add_line_chart(title, y_title, min_col, anchor, width=13, height=7, max_col=None, extra_series_cols=None):
+        ch = LineChart()
+        ch.title = title
+        ch.y_axis.title = y_title
+        ch.x_axis.title = "layer"
+        _style_axis(ch.y_axis)
+        _style_x_axis(ch.x_axis)
+        # The legend often overlaps or wastes space; remove it for dashboard charts.
+        ch.legend = None
+        if max_col is None:
+            data = Reference(ws_layers, min_col=min_col, min_row=1, max_row=max_layer_row)
+        else:
+            data = Reference(ws_layers, min_col=min_col, max_col=max_col, min_row=1, max_row=max_layer_row)
+        ch.add_data(data, titles_from_data=True)
+        # Optional additional series (e.g. config reference lines)
+        if extra_series_cols:
+            for col in extra_series_cols:
+                if col is None:
+                    continue
+                try:
+                    ref = Reference(ws_layers, min_col=int(col), min_row=1, max_row=max_layer_row)
+                    ch.add_data(ref, titles_from_data=True)
+                except Exception:
+                    pass
+        ch.set_categories(cats_layers)
+        ch.height = height
+        ch.width = width
+        ws_dash.add_chart(ch, anchor)
+        return ch
+
+    # Layout: dashboard grid.
+    # Excel positions charts in pixel space. To keep the layout stable across
+    # platforms/zoom levels we:
+    #   - use normal column widths (so anchors correspond to real spacing)
+    #   - reserve a left margin so Y-axis tick labels don't get clipped
+    #   - support two layouts: compact (default) and wide
+    layers_count = max(0, max_layer_row - 1)
+    layout = (layout or "compact").strip().lower()
+    if layout not in ("compact", "wide"):
+        layout = "compact"
+
+    # X-axis label downsampling: keep charts readable when there are hundreds of layers.
+    # Target fewer labels in compact layout, more in wide layout.
+    target_labels = 8 if layout == "compact" else 12
+    label_skip = max(1, layers_count // max(1, target_labels))
+
+    # Column geometry: tighter for compact, more spacious for wide.
+    base_col_w = 9 if layout == "compact" else 12
+    set_basic_column_widths(ws_dash, {get_column_letter(i): base_col_w for i in range(1, 80)})
+    ws_dash.column_dimensions["A"].width = 5  # left margin for y-axis labels
+
+    LEFT = "B"
+    RIGHT = "N" if layout == "compact" else "Q"
+
+    # Auto-scale chart width by number of layers.
+    # More layers => wider charts for readability (without causing overlap).
+    # Clamp to a safe range.
+    if layout == "wide":
+        CH_W = max(16, min(22, 16 + (layers_count / 120.0)))
+        CH_H = 7.6
+    else:
+        CH_W = max(14, min(18, 14 + (layers_count / 200.0)))
+        CH_H = 7.2
+
+    # Vertical spacing: reduce empty gap while keeping charts from touching.
+    # Leave space at the top for the Feature Type table.
+    R1, R2, R3, R4, R5, R6, R7, R8 = 16, 34, 52, 70, 88, 106, 126, 144
+
+    # Row 1
+    time_ch = add_line_chart("Time per Layer (s)", "seconds", 4, f"{LEFT}{R1}", width=CH_W, height=CH_H)
+    speed_ch = add_line_chart("Average Speed per Layer (mm/s)", "mm/s", 7, f"{RIGHT}{R1}", width=CH_W, height=CH_H, extra_series_cols=[ref_cols.get("ref_speed_max_mm_s")] if ref_cols.get("ref_speed_max_mm_s") else None)
+    if ref_cols.get("ref_speed_max_mm_s"):
+        try:
+            speed_ch.y_axis.scaling.max = float(config_info.get("max_print_speed")) * 1.1
+        except Exception:
+            pass
+
+    # Row 2
+    flow_ch = add_line_chart("Average Volumetric Flow per Layer (mm³/s)", "mm³/s", 8, f"{LEFT}{R2}", width=CH_W, height=CH_H, extra_series_cols=[ref_cols.get("ref_flow_max_mm3_s")] if ref_cols.get("ref_flow_max_mm3_s") else None)
+    if ref_cols.get("ref_flow_max_mm3_s"):
+        try:
+            flow_ch.y_axis.scaling.max = float(config_info.get("filament_max_volumetric_speed")) * 1.1
+        except Exception:
+            pass
+
+    # Layer height (column)
+    lh_bar = BarChart()
+    lh_bar.type = "col"
+    lh_bar.title = "Layer Height per Layer (mm)"
+    lh_bar.y_axis.title = "mm"
+    # Keep layer height chart scale tight using config.ini max_layer_height when available
+    cfg_layer_h_max = _ini_value_to_float((config_info or {}).get("max_layer_height"))
+    if cfg_layer_h_max is not None:
+        try:
+            lh_bar.y_axis.scaling.max = float(cfg_layer_h_max) * 1.1
+        except Exception:
+            pass
+    if ref_cols.get("ref_layerheight_max_mm") and config_info and config_info.get("max_layer_height") is not None:
+        try:
+            lh_bar.y_axis.scaling.max = float(config_info.get("max_layer_height")) * 1.1
+        except Exception:
+            pass
+    lh_bar.x_axis.title = "layer"
+    _style_axis(lh_bar.y_axis)
+    _style_x_axis(lh_bar.x_axis)
+    lh_bar.legend = None
+    lh_data = Reference(ws_layers, min_col=3, min_row=1, max_row=max_layer_row)
+    lh_bar.add_data(lh_data, titles_from_data=True)
+    lh_bar.set_categories(cats_layers)
+    lh_bar.height = CH_H
+    lh_bar.width = CH_W
+    ws_dash.add_chart(lh_bar, f"{RIGHT}{R2}")
+
+    # Row 3
+    add_line_chart("Extrusion per Layer (mm of filament)", "mm", 6, f"{LEFT}{R3}", width=CH_W, height=CH_H)
+    add_line_chart("Average Fan per Layer (%)", "%", 15, f"{RIGHT}{R3}", width=CH_W, height=CH_H)
+
+    # Row 4
+    add_line_chart("Set Temperatures per Layer (°C)", "°C", 16, f"{LEFT}{R4}", width=CH_W, height=CH_H, max_col=18)
+
+    # Histograms: speed + flow (from legends)
+    def add_histogram(legend_sheet_name, title, anchor):
+        if not include_legends or legend_sheet_name not in wb.sheetnames:
+            return
+        ws_leg = wb[legend_sheet_name]
+        if ws_leg.max_row < 5:
+            return
+        bar = BarChart()
+        bar.type = "col"
+        bar.title = title
+        bar.y_axis.title = "count"
+        bar.x_axis.title = "bin"
+        _style_axis(bar.y_axis)
+        _style_x_axis(bar.x_axis)
+        bar.legend = None
+        cats = Reference(ws_leg, min_col=1, min_row=5, max_row=ws_leg.max_row)
+        data = Reference(ws_leg, min_col=3, min_row=4, max_row=ws_leg.max_row)
+        bar.add_data(data, titles_from_data=True)
+        bar.set_categories(cats)
+        # Match dashboard sizing so the histograms align with other charts.
+        bar.height = CH_H
+        bar.width = CH_W
+        ws_dash.add_chart(bar, anchor)
+
+    # Row 4 (right): speed histogram
+    add_histogram("Legend_Speed", "Speed Bin Counts", f"{RIGHT}{R4}")
+
+    # Row 5: flow histogram + pie
+    add_histogram("Legend_Flow_mm3s", "Flow (mm³/s) Bin Counts", f"{LEFT}{R5}")
+
+    # Feature type time share pie (always on dashboard)
+    if include_legends and "Legend_FeatureType" in wb.sheetnames:
+        ws_ft = wb["Legend_FeatureType"]
+        if ws_ft.max_row >= 3:
+            pie = PieChart()
+            pie.title = "Feature Type Time Share"
+            labels = Reference(ws_ft, min_col=1, min_row=2, max_row=ws_ft.max_row)
+            data = Reference(ws_ft, min_col=3, min_row=1, max_row=ws_ft.max_row)
+            pie.add_data(data, titles_from_data=True)
+            pie.set_categories(labels)
+            pie.dataLabels = DataLabelList()
+            pie.dataLabels.showPercent = True
+            pie.height = CH_H
+            pie.width = CH_W
+            ws_dash.add_chart(pie, f"{RIGHT}{R5}")
+
+    # Bottom row: Top N slowest layers (span both columns)
+    if ws_top.max_row >= 3:
+        slow_bar = BarChart()
+        slow_bar.type = "col"
+        slow_bar.title = f"Top {top_n} Slowest Layers (time_s)"
+        slow_bar.y_axis.title = "seconds"
+        slow_bar.x_axis.title = "layer"
+        _style_axis(slow_bar.y_axis)
+        _style_x_axis(slow_bar.x_axis)
+        slow_bar.legend = None
+        slow_data = Reference(ws_top, min_col=3, min_row=1, max_row=ws_top.max_row)
+        slow_cats = Reference(ws_top, min_col=2, min_row=2, max_row=ws_top.max_row)
+        slow_bar.add_data(slow_data, titles_from_data=True)
+        slow_bar.set_categories(slow_cats)
+        slow_bar.height = 8
+        slow_bar.width = 31
+        ws_dash.add_chart(slow_bar, f"{LEFT}{R6}")
+
+    # Tuning-focused: worst-case / percentile charts (keep existing averages too)
+    # Columns: I peak_speed, J p95_speed, K peak_flow, L p95_flow
+    peak_sp = add_line_chart("Peak Speed per Layer (mm/s)", "mm/s", 9, f"{LEFT}{R7}", width=CH_W, height=CH_H,
+                             extra_series_cols=[ref_cols.get("ref_speed_max_mm_s")] if ref_cols.get("ref_speed_max_mm_s") else None)
+    p95_sp = add_line_chart("P95 Speed per Layer (mm/s)", "mm/s", 10, f"{RIGHT}{R7}", width=CH_W, height=CH_H,
+                            extra_series_cols=[ref_cols.get("ref_speed_max_mm_s")] if ref_cols.get("ref_speed_max_mm_s") else None)
+    peak_fl = add_line_chart("Peak Volumetric Flow per Layer (mm³/s)", "mm³/s", 11, f"{LEFT}{R8}", width=CH_W, height=CH_H,
+                             extra_series_cols=[ref_cols.get("ref_flow_max_mm3_s")] if ref_cols.get("ref_flow_max_mm3_s") else None)
+    p95_fl = add_line_chart("P95 Volumetric Flow per Layer (mm³/s)", "mm³/s", 12, f"{RIGHT}{R8}", width=CH_W, height=CH_H,
+                            extra_series_cols=[ref_cols.get("ref_flow_max_mm3_s")] if ref_cols.get("ref_flow_max_mm3_s") else None)
+
+    # Scale maxima based on config where available
+    if config_info:
+        try:
+            if config_info.get("max_print_speed") is not None:
+                m = float(config_info.get("max_print_speed")) * 1.1
+                peak_sp.y_axis.scaling.max = m
+                p95_sp.y_axis.scaling.max = m
+        except Exception:
+            pass
+        try:
+            if config_info.get("filament_max_volumetric_speed") is not None:
+                m = float(config_info.get("filament_max_volumetric_speed")) * 1.1
+                peak_fl.y_axis.scaling.max = m
+                p95_fl.y_axis.scaling.max = m
+        except Exception:
+            pass
+
+    # Compare mode (A/B experimentation)
+    if compare_moves and compare_layer_z_map:
+        ws_cb = wb.create_sheet("Compare_Layers")
+        ws_cb.append([
+            "layer",
+            "A_time_s", "B_time_s",
+            "A_peak_flow", "B_peak_flow",
+            "A_p95_flow", "B_p95_flow",
+            "A_peak_speed", "B_peak_speed",
+            "A_p95_speed", "B_p95_speed",
+        ])
+
+        # Build layer stats dicts from existing Layers sheet (A) and a temporary aggregation for B
+        def _layer_stats_from_moves(moves_x, layer_z_x):
+            by = defaultdict(list)
+            for m in moves_x:
+                by[m["layer"]].append(m)
+            out = {}
+            for Lx, msx in by.items():
+                t = sum(m.get("time_s", 0.0) or 0.0 for m in msx)
+                sp_vals = [m["speed_mm_s"] for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+                sp_w = [m["time_s"] for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+                fl_vals = [m["flow_mm3_s"] for m in msx if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
+                fl_w = [m["time_s"] for m in msx if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
+                out[Lx] = {
+                    "time_s": t,
+                    "peak_speed": (max(sp_vals) if sp_vals else None),
+                    "p95_speed": (weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None),
+                    "peak_flow": (max(fl_vals) if fl_vals else None),
+                    "p95_flow": (weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None),
+                }
+            return out
+
+        A = _layer_stats_from_moves(moves, layer_z_map)
+        B = _layer_stats_from_moves(compare_moves, compare_layer_z_map)
+        all_layers = sorted(set(A.keys()) | set(B.keys()))
+        for Lx in all_layers:
+            a = A.get(Lx, {})
+            b = B.get(Lx, {})
+            ws_cb.append([
+                Lx,
+                a.get("time_s"), b.get("time_s"),
+                a.get("peak_flow"), b.get("peak_flow"),
+                a.get("p95_flow"), b.get("p95_flow"),
+                a.get("peak_speed"), b.get("peak_speed"),
+                a.get("p95_speed"), b.get("p95_speed"),
+            ])
+
+        set_basic_column_widths(ws_cb, {"A": 8, "B": 12, "C": 12, "D": 12, "E": 12, "F": 12, "G": 12, "H": 12, "I": 12, "J": 12, "K": 12})
+
+        ws_cs = wb.create_sheet("Compare_Summary")
+        ws_cs.append(["Metric", "A", (compare_label or "B"), "Delta (B-A)"])
+
+        def _sum_or_none(d, key):
+            vals = [v.get(key) for v in d.values() if v.get(key) is not None]
+            return sum(vals) if vals else None
+
+        # Totals
+        total_a = _sum_or_none(A, "time_s")
+        total_b = _sum_or_none(B, "time_s")
+        ws_cs.append(["Total time (s)", total_a, total_b, (total_b - total_a) if total_a is not None and total_b is not None else None])
+        ws_cs.append(["Max peak flow (mm³/s)",
+                      max((v.get("peak_flow") or 0) for v in A.values()) if A else None,
+                      max((v.get("peak_flow") or 0) for v in B.values()) if B else None,
+                      None])
+        ws_cs.append(["Max P95 flow (mm³/s)",
+                      max((v.get("p95_flow") or 0) for v in A.values()) if A else None,
+                      max((v.get("p95_flow") or 0) for v in B.values()) if B else None,
+                      None])
+        ws_cs.append(["Max peak speed (mm/s)",
+                      max((v.get("peak_speed") or 0) for v in A.values()) if A else None,
+                      max((v.get("peak_speed") or 0) for v in B.values()) if B else None,
+                      None])
+        ws_cs.append(["Max P95 speed (mm/s)",
+                      max((v.get("p95_speed") or 0) for v in A.values()) if A else None,
+                      max((v.get("p95_speed") or 0) for v in B.values()) if B else None,
+                      None])
+        set_basic_column_widths(ws_cs, {"A": 26, "B": 14, "C": 14, "D": 14})
+
+        # Overlay charts on dashboard (comparison-focused)
+        # Place them below the existing charts.
+        R9, R10 = 162, 180
+        cats_c = Reference(ws_cb, min_col=1, min_row=2, max_row=ws_cb.max_row)
+
+        def _add_compare_line(title, y_title, col_a, col_b, anchor):
+            ch = LineChart()
+            ch.title = title
+            ch.y_axis.title = y_title
+            ch.x_axis.title = "layer"
+            _style_axis(ch.y_axis)
+            _style_x_axis(ch.x_axis)
+            data = Reference(ws_cb, min_col=col_a, max_col=col_b, min_row=1, max_row=ws_cb.max_row)
+            ch.add_data(data, titles_from_data=True)
+            ch.set_categories(cats_c)
+            ch.height = CH_H
+            ch.width = CH_W
+            ws_dash.add_chart(ch, anchor)
+
+        _add_compare_line("Compare: Layer Time (s)", "seconds", 2, 3, f"{LEFT}{R9}")
+        _add_compare_line("Compare: Peak Flow (mm³/s)", "mm³/s", 4, 5, f"{RIGHT}{R9}")
+        _add_compare_line("Compare: P95 Flow (mm³/s)", "mm³/s", 6, 7, f"{LEFT}{R10}")
+        _add_compare_line("Compare: Peak Speed (mm/s)", "mm/s", 8, 9, f"{RIGHT}{R10}")
+
+    _status("Saving workbook")
+    wb.save(out_path)
+
