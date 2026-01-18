@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, LineChart, PieChart, Reference, ScatterChart
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference, ScatterChart, Series
 from openpyxl.chart.series_factory import SeriesFactory
 from openpyxl.chart.label import DataLabelList
 from openpyxl.formatting.rule import CellIsRule
@@ -775,13 +775,20 @@ def write_xlsx(
 
     def _style_x_axis(axis):
         _style_axis(axis)
-        # Reduce clutter for long category axes (hundreds of layers)
-        axis.tickLblSkip = label_skip
-        axis.tickMarkSkip = label_skip
-        axis.textRotation = 45
-        # Slightly smaller font on x-axis tick labels.
+        # Keep x-axis labels readable and consistent with y-axis.
+        #
+        # For category axes (older LineChart usage), tickLblSkip reduces clutter.
+        # For numeric axes (ScatterChart), tickLblSkip is ignored by Excel.
         try:
-            _rt = _axis_font(9)
+            axis.tickLblSkip = label_skip
+            axis.tickMarkSkip = label_skip
+        except Exception:
+            pass
+        # Avoid rotated, oversized labels (these tend to collide).
+        axis.textRotation = 0
+        # Match y-axis tick label size.
+        try:
+            _rt = _axis_font(10)
             if _rt is not None:
                 axis.txPr = _rt
         except Exception:
@@ -1046,56 +1053,70 @@ def write_xlsx(
             pass
 
     # Compare mode (experimentation)
-    # If multiple compares are provided, we build a summary across all; overlay charts are based on the first compare.
+    # If multiple compares are provided, we build a summary across all.
+    # For charts, we align runs on *Z height* (numeric axis) so prints with different layer heights still line up.
     if compare_runs:
         ws_cb = wb.create_sheet("Compare_Layers")
-        ws_cb.append([
-            "layer",
-            "A_time_s", "B_time_s",
-            "A_peak_flow", "B_peak_flow",
-            "A_p95_flow", "B_p95_flow",
-            "A_peak_speed", "B_peak_speed",
-            "A_p95_speed", "B_p95_speed",
-        ])
 
-        # Build layer stats dicts from existing Layers sheet (A) and a temporary aggregation for B
-        def _layer_stats_from_moves(moves_x, layer_z_x):
+        def _layer_stats_series(moves_x, layer_z_x):
+            """Return per-layer stats as a list of rows sorted by Z.
+
+            Each element: (z, layer, time_s, peak_flow, p95_flow, peak_speed, p95_speed)
+            """
             by = defaultdict(list)
             for m in moves_x:
                 by[m["layer"]].append(m)
-            out = {}
+
+            rows = []
             for Lx, msx in by.items():
+                z = layer_z_x.get(Lx)
+                if z is None:
+                    # Fall back to last Z we saw in that layer
+                    z = msx[-1].get("z")
+
                 t = sum(m.get("time_s", 0.0) or 0.0 for m in msx)
                 sp_vals = [m["speed_mm_s"] for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
-                sp_w = [m["time_s"] for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
-                fl_vals = [m["flow_mm3_s"] for m in msx if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
-                fl_w = [m["time_s"] for m in msx if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
-                out[Lx] = {
-                    "time_s": t,
-                    "peak_speed": (max(sp_vals) if sp_vals else None),
-                    "p95_speed": (weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None),
-                    "peak_flow": (max(fl_vals) if fl_vals else None),
-                    "p95_flow": (weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None),
-                }
-            return out
+                sp_w = [m.get("time_s") or 0.0 for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+                fl_vals = [m["flow_mm3_s"] for m in msx if (m.get("flow_mm3_s") or 0.0) > 0.0]
+                fl_w = [m.get("time_s") or 0.0 for m in msx if (m.get("flow_mm3_s") or 0.0) > 0.0]
 
-        A = _layer_stats_from_moves(moves, layer_z_map)
+                peak_speed = max(sp_vals) if sp_vals else None
+                p95_speed = weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None
+                peak_flow = max(fl_vals) if fl_vals else None
+                p95_flow = weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None
+                rows.append((z, Lx, t, peak_flow, p95_flow, peak_speed, p95_speed))
+
+            # Sort by Z (None last)
+            rows.sort(key=lambda r: (float("inf") if r[0] is None else r[0]))
+            return rows
+
+        # A is the primary run
+        A_rows = _layer_stats_series(moves, layer_z_map)
+        # B is the first compare run for overlay charts
         first = compare_runs[0]
-        B = _layer_stats_from_moves(first["moves"], first["layer_z_map"])
-        all_layers = sorted(set(A.keys()) | set(B.keys()))
-        for Lx in all_layers:
-            a = A.get(Lx, {})
-            b = B.get(Lx, {})
+        B_rows = _layer_stats_series(first["moves"], first["layer_z_map"])
+
+        ws_cb.append([
+            "A_z_mm", "A_layer", "A_time_s", "A_peak_flow", "A_p95_flow", "A_peak_speed", "A_p95_speed",
+            "B_z_mm", "B_layer", "B_time_s", "B_peak_flow", "B_p95_flow", "B_peak_speed", "B_p95_speed",
+        ])
+
+        n = max(len(A_rows), len(B_rows))
+        for i in range(n):
+            a = A_rows[i] if i < len(A_rows) else (None, None, None, None, None, None, None)
+            b = B_rows[i] if i < len(B_rows) else (None, None, None, None, None, None, None)
             ws_cb.append([
-                Lx,
-                a.get("time_s"), b.get("time_s"),
-                a.get("peak_flow"), b.get("peak_flow"),
-                a.get("p95_flow"), b.get("p95_flow"),
-                a.get("peak_speed"), b.get("peak_speed"),
-                a.get("p95_speed"), b.get("p95_speed"),
+                a[0], a[1], a[2], a[3], a[4], a[5], a[6],
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6],
             ])
 
-        set_basic_column_widths(ws_cb, {"A": 8, "B": 12, "C": 12, "D": 12, "E": 12, "F": 12, "G": 12, "H": 12, "I": 12, "J": 12, "K": 12})
+        set_basic_column_widths(
+            ws_cb,
+            {
+                "A": 10, "B": 8, "C": 12, "D": 12, "E": 12, "F": 12, "G": 12,
+                "H": 10, "I": 8, "J": 12, "K": 12, "L": 12, "M": 12, "N": 12,
+            },
+        )
 
         ws_cs = wb.create_sheet("Compare_Summary")
         header = ["Metric", "A"]
@@ -1117,8 +1138,41 @@ def write_xlsx(
                     row.append(None)
             return row
 
+        def _layer_stats_from_moves(moves_x, layer_z_x):
+            """Aggregate per-layer stats into a dict keyed by layer index.
+
+            Values include:
+              - time_s
+              - peak_flow, p95_flow
+              - peak_speed, p95_speed
+
+            Percentiles are time-weighted.
+            """
+            by = defaultdict(list)
+            for m in moves_x:
+                by[m["layer"]].append(m)
+
+            out = {}
+            for Lx, msx in by.items():
+                t = sum(m.get("time_s", 0.0) or 0.0 for m in msx)
+                sp_vals = [m["speed_mm_s"] for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+                sp_w = [m.get("time_s") or 0.0 for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+                fl_vals = [m["flow_mm3_s"] for m in msx if (m.get("flow_mm3_s") or 0.0) > 0.0]
+                fl_w = [m.get("time_s") or 0.0 for m in msx if (m.get("flow_mm3_s") or 0.0) > 0.0]
+
+                out[Lx] = {
+                    "z": layer_z_x.get(Lx, msx[-1].get("z")),
+                    "time_s": t,
+                    "peak_flow": max(fl_vals) if fl_vals else None,
+                    "p95_flow": weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None,
+                    "peak_speed": max(sp_vals) if sp_vals else None,
+                    "p95_speed": weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None,
+                }
+            return out
+
         # Totals and maxima for each compare
-        total_a = _sum_or_none(A, "time_s")
+        A_dict = _layer_stats_from_moves(moves, layer_z_map)
+        total_a = _sum_or_none(A_dict, "time_s")
         b_dicts = [_layer_stats_from_moves(r["moves"], r["layer_z_map"]) for r in compare_runs]
         totals_b = [_sum_or_none(d, "time_s") for d in b_dicts]
         ws_cs.append(_metric_row("Total time (s)", total_a, totals_b))
@@ -1128,10 +1182,10 @@ def write_xlsx(
                 return None
             return max((v.get(key) or 0) for v in d.values())
 
-        ws_cs.append(_metric_row("Max peak flow (mm³/s)", _max_key(A, "peak_flow"), [_max_key(d, "peak_flow") for d in b_dicts]))
-        ws_cs.append(_metric_row("Max P95 flow (mm³/s)", _max_key(A, "p95_flow"), [_max_key(d, "p95_flow") for d in b_dicts]))
-        ws_cs.append(_metric_row("Max peak speed (mm/s)", _max_key(A, "peak_speed"), [_max_key(d, "peak_speed") for d in b_dicts]))
-        ws_cs.append(_metric_row("Max P95 speed (mm/s)", _max_key(A, "p95_speed"), [_max_key(d, "p95_speed") for d in b_dicts]))
+        ws_cs.append(_metric_row("Max peak flow (mm³/s)", _max_key(A_dict, "peak_flow"), [_max_key(d, "peak_flow") for d in b_dicts]))
+        ws_cs.append(_metric_row("Max P95 flow (mm³/s)", _max_key(A_dict, "p95_flow"), [_max_key(d, "p95_flow") for d in b_dicts]))
+        ws_cs.append(_metric_row("Max peak speed (mm/s)", _max_key(A_dict, "peak_speed"), [_max_key(d, "peak_speed") for d in b_dicts]))
+        ws_cs.append(_metric_row("Max P95 speed (mm/s)", _max_key(A_dict, "p95_speed"), [_max_key(d, "p95_speed") for d in b_dicts]))
 
         # Widths
         widths = {"A": 26, "B": 14}
@@ -1144,31 +1198,75 @@ def write_xlsx(
 
         # Overlay charts on dashboard (comparison-focused)
         # Place them *below* the existing dashboard charts.
-        # The main dashboard currently uses R1..R9; start comparison charts
-        # two chart blocks below R9 to avoid any overlap even with Excel's
-        # pixel-based positioning.
         compare_r1 = R9 + 36
         compare_r2 = compare_r1 + 18
-        cats_c = Reference(ws_cb, min_col=1, min_row=2, max_row=ws_cb.max_row)
 
-        def _add_compare_line(title, y_title, col_a, col_b, anchor):
-            ch = LineChart()
+        def _nice_major_unit(max_x, target_ticks=8):
+            if max_x is None or max_x <= 0:
+                return None
+            raw = max_x / float(target_ticks)
+            # round to 1/2/5 * 10^n
+            exp = math.floor(math.log10(raw)) if raw > 0 else 0
+            base = raw / (10 ** exp)
+            if base <= 1:
+                nice = 1
+            elif base <= 2:
+                nice = 2
+            elif base <= 5:
+                nice = 5
+            else:
+                nice = 10
+            return nice * (10 ** exp)
+
+        # Determine X axis range from both runs' Z
+        max_z = None
+        for col in (1, 8):
+            vals = [r[0] for r in ws_cb.iter_rows(min_row=2, min_col=col, max_col=col, values_only=True) if r[0] is not None]
+            if vals:
+                mz = max(vals)
+                max_z = mz if max_z is None else max(max_z, mz)
+
+        major = _nice_major_unit(max_z, target_ticks=7)
+
+        def _add_compare_scatter(title, y_title, col_ax, col_ay, col_bx, col_by, anchor):
+            ch = ScatterChart()
             ch.title = title
             ch.y_axis.title = y_title
-            ch.x_axis.title = "layer"
+            ch.x_axis.title = "Z (mm)"
             _style_axis(ch.y_axis)
             _style_x_axis(ch.x_axis)
-            data = Reference(ws_cb, min_col=col_a, max_col=col_b, min_row=1, max_row=ws_cb.max_row)
-            ch.add_data(data, titles_from_data=True)
-            ch.set_categories(cats_c)
+
+            # Force X/Y tick label font parity (Excel can otherwise enlarge X labels)
+            try:
+                ch.x_axis.txPr = ch.y_axis.txPr
+            except Exception:
+                pass
+
+            if major is not None:
+                ch.x_axis.majorUnit = major
+
+            # A series
+            x_a = Reference(ws_cb, min_col=col_ax, min_row=2, max_row=ws_cb.max_row)
+            y_a = Reference(ws_cb, min_col=col_ay, min_row=1, max_row=ws_cb.max_row)
+            s_a = Series(y_a, x_a, title_from_data=True)
+            ch.series.append(s_a)
+
+            # B series
+            x_b = Reference(ws_cb, min_col=col_bx, min_row=2, max_row=ws_cb.max_row)
+            y_b = Reference(ws_cb, min_col=col_by, min_row=1, max_row=ws_cb.max_row)
+            s_b = Series(y_b, x_b, title_from_data=True)
+            ch.series.append(s_b)
+
             ch.height = CH_H
             ch.width = CH_W
             ws_dash.add_chart(ch, anchor)
 
-        _add_compare_line("Compare: Layer Time (s)", "seconds", 2, 3, f"{LEFT}{compare_r1}")
-        _add_compare_line("Compare: Peak Flow (mm³/s)", "mm³/s", 4, 5, f"{RIGHT}{compare_r1}")
-        _add_compare_line("Compare: P95 Flow (mm³/s)", "mm³/s", 6, 7, f"{LEFT}{compare_r2}")
-        _add_compare_line("Compare: Peak Speed (mm/s)", "mm/s", 8, 9, f"{RIGHT}{compare_r2}")
+        # Columns: A_z(1) A_time(3) A_peak_flow(4) A_p95_flow(5) A_peak_speed(6)
+        #          B_z(8) B_time(10) B_peak_flow(11) B_p95_flow(12) B_peak_speed(13)
+        _add_compare_scatter("Compare: Layer Time (s)", "seconds", 1, 3, 8, 10, f"{LEFT}{compare_r1}")
+        _add_compare_scatter("Compare: Peak Flow (mm³/s)", "mm³/s", 1, 4, 8, 11, f"{RIGHT}{compare_r1}")
+        _add_compare_scatter("Compare: P95 Flow (mm³/s)", "mm³/s", 1, 5, 8, 12, f"{LEFT}{compare_r2}")
+        _add_compare_scatter("Compare: Peak Speed (mm/s)", "mm/s", 1, 6, 8, 13, f"{RIGHT}{compare_r2}")
 
     _status("Saving workbook")
     wb.save(out_path)
