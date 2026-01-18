@@ -4,12 +4,22 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference, ScatterChart
+from openpyxl.chart.series_factory import SeriesFactory
 from openpyxl.chart.label import DataLabelList
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.drawing.text import RichText, Paragraph, ParagraphProperties, CharacterProperties
+# RichText support differs across openpyxl versions.
+# Some versions (e.g. in certain CI environments) do not expose RichText.
+try:
+    from openpyxl.drawing.text import RichText, Paragraph, ParagraphProperties, CharacterProperties
+except Exception:  # pragma: no cover
+    RichText = None
+    Paragraph = None
+    ParagraphProperties = None
+    CharacterProperties = None
+
 
 from .stats import weighted_quantile, make_bins, bin_counts
 from .gcode_parser import filament_area_mm2
@@ -731,13 +741,15 @@ def write_xlsx(
     # We'll set the skip factor after deciding the dashboard layout.
     label_skip = 1
 
-    def _axis_font(size_pt: float) -> RichText:
+    def _axis_font(size_pt: float):
         """Create a RichText object that sets axis tick label font size.
 
         openpyxl doesn't expose a simple `font` property for axis tick labels.
         Setting `axis.txPr` with a RichText paragraph is the most reliable
         cross-platform way to control tick label size.
         """
+        if RichText is None or Paragraph is None or ParagraphProperties is None or CharacterProperties is None:
+            return None
         # Excel stores font size in 1/100 pt.
         sz = int(round(size_pt * 100))
         ppr = ParagraphProperties(defRPr=CharacterProperties(sz=sz))
@@ -754,7 +766,9 @@ def write_xlsx(
         # Ensure tick label font is readable and doesn't balloon.
         # 10pt is a good default for Y-axis.
         try:
-            axis.txPr = _axis_font(10)
+            _rt = _axis_font(10)
+            if _rt is not None:
+                axis.txPr = _rt
         except Exception:
             pass
         return axis
@@ -767,36 +781,77 @@ def write_xlsx(
         axis.textRotation = 45
         # Slightly smaller font on x-axis tick labels.
         try:
-            axis.txPr = _axis_font(9)
+            _rt = _axis_font(9)
+            if _rt is not None:
+                axis.txPr = _rt
         except Exception:
             pass
         return axis
 
     def add_line_chart(title, y_title, min_col, anchor, width=13, height=7, max_col=None, extra_series_cols=None):
-        ch = LineChart()
+        """Add a per-layer trend chart.
+
+        We intentionally use a ScatterChart (numeric X axis) instead of a LineChart
+        (category axis). Category axes become unreadable for prints with hundreds
+        of layers because Excel tries to render too many tick labels and may scale
+        the font up aggressively. ScatterChart gives us a numeric axis where we can
+        control the tick interval (majorUnit) and keep labels readable.
+        """
+        ch = ScatterChart()
         ch.title = title
         ch.y_axis.title = y_title
         ch.x_axis.title = "layer"
+
+        # Axes styling
         _style_axis(ch.y_axis)
-        _style_x_axis(ch.x_axis)
-        # The legend often overlaps or wastes space; remove it for dashboard charts.
+        _style_axis(ch.x_axis)
         ch.legend = None
+
+        # Numeric X values (layer index)
+        xvalues = Reference(ws_layers, min_col=1, min_row=2, max_row=max_layer_row)
+
+        def _add_series(col_idx: int):
+            # Use header cell as series title.
+            yvalues = Reference(ws_layers, min_col=col_idx, min_row=2, max_row=max_layer_row)
+            # Use openpyxl's SeriesFactory for cross-version compatibility.
+            s = SeriesFactory(yvalues, xvalues=xvalues, title=None, title_from_data=False)
+            try:
+                s.title = ws_layers.cell(row=1, column=col_idx).value
+            except Exception:
+                pass
+            ch.series.append(s)
+
+        # Primary series columns
         if max_col is None:
-            data = Reference(ws_layers, min_col=min_col, min_row=1, max_row=max_layer_row)
+            _add_series(int(min_col))
         else:
-            data = Reference(ws_layers, min_col=min_col, max_col=max_col, min_row=1, max_row=max_layer_row)
-        ch.add_data(data, titles_from_data=True)
+            for c in range(int(min_col), int(max_col) + 1):
+                _add_series(c)
+
         # Optional additional series (e.g. config reference lines)
         if extra_series_cols:
             for col in extra_series_cols:
                 if col is None:
                     continue
                 try:
-                    ref = Reference(ws_layers, min_col=int(col), min_row=1, max_row=max_layer_row)
-                    ch.add_data(ref, titles_from_data=True)
+                    _add_series(int(col))
                 except Exception:
                     pass
-        ch.set_categories(cats_layers)
+
+        # Tick spacing: keep labels from colliding even when Excel chooses a
+        # very large default font for axis labels. We intentionally target a
+        # small number of labels.
+        try:
+            n = max(1, max_layer_row - 1)
+            target = 6 if (layout or "compact").strip().lower() == "compact" else 8
+            major = max(1, int(math.ceil(n / float(target))))
+            ch.x_axis.majorUnit = major
+        except Exception:
+            pass
+
+        # Make the axis labels smaller and avoid rotation; numeric axis labels are sparse.
+        ch.x_axis.textRotation = 0
+
         ch.height = height
         ch.width = width
         ws_dash.add_chart(ch, anchor)
@@ -1088,8 +1143,12 @@ def write_xlsx(
         set_basic_column_widths(ws_cs, widths)
 
         # Overlay charts on dashboard (comparison-focused)
-        # Place them below the existing charts.
-        R9, R10 = 162, 180
+        # Place them *below* the existing dashboard charts.
+        # The main dashboard currently uses R1..R9; start comparison charts
+        # two chart blocks below R9 to avoid any overlap even with Excel's
+        # pixel-based positioning.
+        compare_r1 = R9 + 36
+        compare_r2 = compare_r1 + 18
         cats_c = Reference(ws_cb, min_col=1, min_row=2, max_row=ws_cb.max_row)
 
         def _add_compare_line(title, y_title, col_a, col_b, anchor):
@@ -1106,10 +1165,10 @@ def write_xlsx(
             ch.width = CH_W
             ws_dash.add_chart(ch, anchor)
 
-        _add_compare_line("Compare: Layer Time (s)", "seconds", 2, 3, f"{LEFT}{R9}")
-        _add_compare_line("Compare: Peak Flow (mm³/s)", "mm³/s", 4, 5, f"{RIGHT}{R9}")
-        _add_compare_line("Compare: P95 Flow (mm³/s)", "mm³/s", 6, 7, f"{LEFT}{R10}")
-        _add_compare_line("Compare: Peak Speed (mm/s)", "mm/s", 8, 9, f"{RIGHT}{R10}")
+        _add_compare_line("Compare: Layer Time (s)", "seconds", 2, 3, f"{LEFT}{compare_r1}")
+        _add_compare_line("Compare: Peak Flow (mm³/s)", "mm³/s", 4, 5, f"{RIGHT}{compare_r1}")
+        _add_compare_line("Compare: P95 Flow (mm³/s)", "mm³/s", 6, 7, f"{LEFT}{compare_r2}")
+        _add_compare_line("Compare: Peak Speed (mm/s)", "mm/s", 8, 9, f"{RIGHT}{compare_r2}")
 
     _status("Saving workbook")
     wb.save(out_path)
@@ -1117,6 +1176,8 @@ def write_xlsx(
 
 def _aggregate_layers_for_export(moves, layer_z_map, config_info=None):
     """Return list of dict rows matching the Layers sheet schema (subset).
+    if RichText is None:
+        return None
 
     This is used for CSV/JSON sidecars and tests. Keep it lightweight and stable.
     """
