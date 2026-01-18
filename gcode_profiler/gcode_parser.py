@@ -103,9 +103,10 @@ def parse_gcode(
             # Layer markers
             m = re_layer.search(line)
             if m:
+                saw_layer_tag = True
                 current_layer = int(m.group(1))
                 continue
-                saw_layer_tag = True
+
 
             m = re_z.search(line)
             if m:

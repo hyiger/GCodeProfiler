@@ -31,9 +31,8 @@ def write_xlsx(
     filament_density_g_cm3: float,
     config_info: dict | None = None,
     layout: str = "compact",
-    compare_moves=None,
-    compare_layer_z_map=None,
-    compare_label: str | None = None,
+    compare_runs: list | None = None,
+    top_n_segments: int = 200,
     status_cb=None,
 ):
     def _status(msg: str):
@@ -117,8 +116,18 @@ def write_xlsx(
             "avg_flow_mm3_s",
             "peak_speed_mm_s",
             "p95_speed_mm_s",
+            "p99_speed_mm_s",
             "peak_flow_mm3_s",
             "p95_flow_mm3_s",
+            "p99_flow_mm3_s",
+            "flow_headroom_p99_mm3_s",
+            "speed_headroom_p99_mm_s",
+            "travel_time_s",
+            "travel_dist_mm",
+            "extrude_time_s",
+            "retract_count",
+            "retract_mm",
+            "dynamics_score",
             "over_flow_time_pct",
             "over_speed_time_pct",
             "avg_fan_pct",
@@ -159,11 +168,41 @@ def write_xlsx(
 
         peak_speed = max(sp_vals) if sp_vals else None
         p95_speed = weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None
+        p99_speed = weighted_quantile(sp_vals, sp_w, 0.99) if sp_vals else None
         peak_flow = max(fl_vals) if fl_vals else None
         p95_flow = weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None
+        p99_flow = weighted_quantile(fl_vals, fl_w, 0.99) if fl_vals else None
+
+        # Travel / extrusion / retraction diagnostics
+        travel_time = sum(m["time_s"] for m in ms if (m.get("de_mm") or 0.0) == 0.0 and (m.get("dist_mm") or 0.0) > 0.0)
+        travel_dist = sum(m["dist_mm"] for m in ms if (m.get("de_mm") or 0.0) == 0.0 and (m.get("dist_mm") or 0.0) > 0.0)
+        extrude_time = sum(m["time_s"] for m in ms if (m.get("de_mm") or 0.0) > 0.0 and (m.get("time_s") or 0.0) > 0.0)
+        retract_moves = [m for m in ms if (m.get("de_mm") or 0.0) < 0.0]
+        retract_count = len(retract_moves)
+        retract_mm = -sum(m.get("de_mm") or 0.0 for m in retract_moves)
+
+        # Simple dynamics proxy: count short, fast extrusion segments (ringing / PA sensitivity proxy)
+        short_fast = 0
+        for m in ms:
+            if (m.get("de_mm") or 0.0) > 0.0 and (m.get("dist_mm") or 0.0) > 0.0:
+                if (m.get("dist_mm") or 0.0) < 0.6 and (m.get("speed_mm_s") or 0.0) > 50.0:
+                    short_fast += 1
+        dynamics_score = short_fast
 
         flow_limit = (config_info or {}).get("filament_max_volumetric_speed")
         speed_limit = (config_info or {}).get("max_print_speed")
+        flow_headroom = None
+        speed_headroom = None
+        try:
+            if flow_limit is not None and p99_flow is not None:
+                flow_headroom = float(flow_limit) - float(p99_flow)
+        except Exception:
+            pass
+        try:
+            if speed_limit is not None and p99_speed is not None:
+                speed_headroom = float(speed_limit) - float(p99_speed)
+        except Exception:
+            pass
         over_flow_pct = None
         over_speed_pct = None
         if t and t > 0:
@@ -211,8 +250,18 @@ def write_xlsx(
             avg_flow,
             peak_speed,
             p95_speed,
+            p99_speed,
             peak_flow,
             p95_flow,
+            p99_flow,
+            flow_headroom,
+            speed_headroom,
+            travel_time,
+            travel_dist,
+            extrude_time,
+            retract_count,
+            retract_mm,
+            dynamics_score,
             over_flow_pct,
             over_speed_pct,
             avg_fan,
@@ -264,10 +313,20 @@ def write_xlsx(
             "L": 16,
             "M": 16,
             "N": 16,
-            "O": 12,
-            "P": 14,
-            "Q": 12,
-            "R": 12,
+            "O": 18,
+            "P": 18,
+            "Q": 14,
+            "R": 14,
+            "S": 14,
+            "T": 14,
+            "U": 14,
+            "V": 14,
+            "W": 14,
+            "X": 14,
+            "Y": 12,
+            "Z": 12,
+            "AA": 12,
+            "AB": 12,
         },
     )
 
@@ -289,7 +348,7 @@ def write_xlsx(
                 f"G2:G{last}",
                 CellIsRule(operator='greaterThan', formula=[str(float(max_speed))], fill=yellow_fill)
             )
-            # Peak/P95 speed
+            # Peak/P95/P99 speed
             ws_layers.conditional_formatting.add(
                 f"I2:I{last}",
                 CellIsRule(operator='greaterThan', formula=[str(float(max_speed))], fill=yellow_fill)
@@ -298,19 +357,27 @@ def write_xlsx(
                 f"J2:J{last}",
                 CellIsRule(operator='greaterThan', formula=[str(float(max_speed))], fill=yellow_fill)
             )
+            ws_layers.conditional_formatting.add(
+                f"K2:K{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_speed))], fill=yellow_fill)
+            )
         # Avg flow (col H)
         if max_flow is not None:
             ws_layers.conditional_formatting.add(
                 f"H2:H{last}",
                 CellIsRule(operator='greaterThan', formula=[str(float(max_flow))], fill=red_fill)
             )
-            # Peak/P95 flow
+            # Peak/P95/P99 flow
             ws_layers.conditional_formatting.add(
-                f"K2:K{last}",
+                f"L2:L{last}",
                 CellIsRule(operator='greaterThan', formula=[str(float(max_flow))], fill=red_fill)
             )
             ws_layers.conditional_formatting.add(
-                f"L2:L{last}",
+                f"M2:M{last}",
+                CellIsRule(operator='greaterThan', formula=[str(float(max_flow))], fill=red_fill)
+            )
+            ws_layers.conditional_formatting.add(
+                f"N2:N{last}",
                 CellIsRule(operator='greaterThan', formula=[str(float(max_flow))], fill=red_fill)
             )
         # Layer height bounds (col C)
@@ -512,6 +579,58 @@ def write_xlsx(
 
         set_basic_column_widths(ws_ff, {"A": 34, "B": 12, "C": 10, "D": 16, "E": 16, "F": 16, "G": 16, "H": 16, "I": 16, "J": 18, "K": 18, "L": 12})
 
+    # Top segments by volumetric flow (helps find brief spikes)
+    _status("Computing top flow segments")
+    ws_top = wb.create_sheet("Top_Flow_Segments")
+    ws_top.append([
+        "rank", "layer", "type", "z_mm", "x0", "y0", "x1", "y1",
+        "dist_mm", "de_mm", "time_s", "speed_mm_s", "flow_mm3_s"
+    ])
+    extrude_segs = [m for m in moves if (m.get("de_mm") or 0.0) > 0.0 and (m.get("time_s") or 0.0) > 0.0 and (m.get("flow_mm3_s") or 0.0) > 0.0]
+    extrude_segs.sort(key=lambda m: (m.get("flow_mm3_s") or 0.0), reverse=True)
+    for idx, m in enumerate(extrude_segs[:max(1, int(top_n_segments))], start=1):
+        ws_top.append([
+            idx,
+            m.get("layer"),
+            m.get("type"),
+            m.get("z"),
+            m.get("x0"), m.get("y0"), m.get("x1"), m.get("y1"),
+            m.get("dist_mm"), m.get("de_mm"), m.get("time_s"),
+            m.get("speed_mm_s"), m.get("flow_mm3_s"),
+        ])
+    set_basic_column_widths(ws_top, {"A": 6, "B": 8, "C": 28, "D": 10, "E": 10, "F": 10, "G": 10, "H": 10, "I": 10, "J": 10, "K": 10, "L": 12, "M": 12})
+
+    # Flow histogram by feature type (time-weighted) for quick diagnosis
+    _status("Computing feature-type flow histograms")
+    ws_fh = wb.create_sheet("FeatureFlow_Hist")
+    ws_fh.append(["Feature type", "bin_lo", "bin_hi", "time_s", "time_pct"])
+    flow_values = [m.get("flow_mm3_s") for m in extrude_segs]
+    if flow_values:
+        lo = 0.0
+        hi = max(flow_values)
+        if (config_info or {}).get("filament_max_volumetric_speed") is not None:
+            try:
+                hi = max(hi, float((config_info or {}).get("filament_max_volumetric_speed")))
+            except Exception:
+                pass
+        bins_spec = make_bins(lo, hi, bins)
+        total_time = sum(m.get("time_s") or 0.0 for m in extrude_segs)
+        by_type = defaultdict(list)
+        for m in extrude_segs:
+            by_type[m.get("type") or "UNKNOWN"].append(m)
+        for t, ms in sorted(by_type.items(), key=lambda kv: sum(m.get("time_s") or 0.0 for m in kv[1]), reverse=True):
+            for (b_lo, b_hi) in bins_spec:
+                bt = 0.0
+                for m in ms:
+                    v = m.get("flow_mm3_s") or 0.0
+                    if b_lo <= v < b_hi or (b_hi == bins_spec[-1][1] and b_lo <= v <= b_hi):
+                        bt += m.get("time_s") or 0.0
+                pct = (bt / total_time) if total_time > 0 else None
+                ws_fh.append([t, b_lo, b_hi, bt, pct])
+    set_basic_column_widths(ws_fh, {"A": 34, "B": 12, "C": 12, "D": 12, "E": 12})
+    for cell in ws_fh["E"][1:]:
+        cell.number_format = "0.0%"
+
     # Top N slowest layers
     ws_top = wb.create_sheet("Top_Slowest_Layers")
     ws_top.append(["rank", "layer", "time_s", "z_mm", "avg_speed_mm_s", "avg_flow_mm3_s", "avg_fan_pct", "hotend_set_C", "bed_set_C", "chamber_set_C"])
@@ -525,7 +644,7 @@ def write_xlsx(
     layer_rows_sorted = sorted(layer_rows, key=lambda r: (r[3] if r[3] is not None else -1), reverse=True)
     top_n = max(1, int(top_n_slowest))
     for i, r in enumerate(layer_rows_sorted[:top_n], start=1):
-        ws_top.append([i, r[0], r[3], r[1], r[6], r[7], r[14], r[15], r[16], r[17]])
+        ws_top.append([i, r[0], r[3], r[1], r[6], r[7], r[24], r[25], r[26], r[27]])
 
     set_basic_column_widths(ws_top, {"A": 6, "B": 8, "C": 12, "D": 10, "E": 16, "F": 16, "G": 12, "H": 14, "I": 12, "J": 12})
 
@@ -695,7 +814,7 @@ def write_xlsx(
 
     # Vertical spacing: reduce empty gap while keeping charts from touching.
     # Leave space at the top for the Feature Type table.
-    R1, R2, R3, R4, R5, R6, R7, R8 = 16, 34, 52, 70, 88, 106, 126, 144
+    R1, R2, R3, R4, R5, R6, R7, R8, R9 = 16, 34, 52, 70, 88, 106, 126, 144, 162
 
     # Row 1
     time_ch = add_line_chart("Time per Layer (s)", "seconds", 4, f"{LEFT}{R1}", width=CH_W, height=CH_H)
@@ -744,10 +863,10 @@ def write_xlsx(
 
     # Row 3
     add_line_chart("Extrusion per Layer (mm of filament)", "mm", 6, f"{LEFT}{R3}", width=CH_W, height=CH_H)
-    add_line_chart("Average Fan per Layer (%)", "%", 15, f"{RIGHT}{R3}", width=CH_W, height=CH_H)
+    add_line_chart("Average Fan per Layer (%)", "%", 25, f"{RIGHT}{R3}", width=CH_W, height=CH_H)
 
     # Row 4
-    add_line_chart("Set Temperatures per Layer (°C)", "°C", 16, f"{LEFT}{R4}", width=CH_W, height=CH_H, max_col=18)
+    add_line_chart("Set Temperatures per Layer (°C)", "°C", 26, f"{LEFT}{R4}", width=CH_W, height=CH_H, max_col=28)
 
     # Histograms: speed + flow (from legends)
     def add_histogram(legend_sheet_name, title, anchor):
@@ -814,14 +933,18 @@ def write_xlsx(
         ws_dash.add_chart(slow_bar, f"{LEFT}{R6}")
 
     # Tuning-focused: worst-case / percentile charts (keep existing averages too)
-    # Columns: I peak_speed, J p95_speed, K peak_flow, L p95_flow
+    # Columns: I peak_speed, J p95_speed, K p99_speed, L peak_flow, M p95_flow, N p99_flow
     peak_sp = add_line_chart("Peak Speed per Layer (mm/s)", "mm/s", 9, f"{LEFT}{R7}", width=CH_W, height=CH_H,
                              extra_series_cols=[ref_cols.get("ref_speed_max_mm_s")] if ref_cols.get("ref_speed_max_mm_s") else None)
     p95_sp = add_line_chart("P95 Speed per Layer (mm/s)", "mm/s", 10, f"{RIGHT}{R7}", width=CH_W, height=CH_H,
                             extra_series_cols=[ref_cols.get("ref_speed_max_mm_s")] if ref_cols.get("ref_speed_max_mm_s") else None)
-    peak_fl = add_line_chart("Peak Volumetric Flow per Layer (mm³/s)", "mm³/s", 11, f"{LEFT}{R8}", width=CH_W, height=CH_H,
+    p99_sp = add_line_chart("P99 Speed per Layer (mm/s)", "mm/s", 11, f"{LEFT}{R8}", width=CH_W, height=CH_H,
+                            extra_series_cols=[ref_cols.get("ref_speed_max_mm_s")] if ref_cols.get("ref_speed_max_mm_s") else None)
+    peak_fl = add_line_chart("Peak Volumetric Flow per Layer (mm³/s)", "mm³/s", 12, f"{RIGHT}{R8}", width=CH_W, height=CH_H,
                              extra_series_cols=[ref_cols.get("ref_flow_max_mm3_s")] if ref_cols.get("ref_flow_max_mm3_s") else None)
-    p95_fl = add_line_chart("P95 Volumetric Flow per Layer (mm³/s)", "mm³/s", 12, f"{RIGHT}{R8}", width=CH_W, height=CH_H,
+    p95_fl = add_line_chart("P95 Volumetric Flow per Layer (mm³/s)", "mm³/s", 13, f"{LEFT}{R9}", width=CH_W, height=CH_H,
+                            extra_series_cols=[ref_cols.get("ref_flow_max_mm3_s")] if ref_cols.get("ref_flow_max_mm3_s") else None)
+    p99_fl = add_line_chart("P99 Volumetric Flow per Layer (mm³/s)", "mm³/s", 14, f"{RIGHT}{R9}", width=CH_W, height=CH_H,
                             extra_series_cols=[ref_cols.get("ref_flow_max_mm3_s")] if ref_cols.get("ref_flow_max_mm3_s") else None)
 
     # Scale maxima based on config where available
@@ -831,6 +954,7 @@ def write_xlsx(
                 m = float(config_info.get("max_print_speed")) * 1.1
                 peak_sp.y_axis.scaling.max = m
                 p95_sp.y_axis.scaling.max = m
+                p99_sp.y_axis.scaling.max = m
         except Exception:
             pass
         try:
@@ -838,11 +962,13 @@ def write_xlsx(
                 m = float(config_info.get("filament_max_volumetric_speed")) * 1.1
                 peak_fl.y_axis.scaling.max = m
                 p95_fl.y_axis.scaling.max = m
+                p99_fl.y_axis.scaling.max = m
         except Exception:
             pass
 
-    # Compare mode (A/B experimentation)
-    if compare_moves and compare_layer_z_map:
+    # Compare mode (experimentation)
+    # If multiple compares are provided, we build a summary across all; overlay charts are based on the first compare.
+    if compare_runs:
         ws_cb = wb.create_sheet("Compare_Layers")
         ws_cb.append([
             "layer",
@@ -875,7 +1001,8 @@ def write_xlsx(
             return out
 
         A = _layer_stats_from_moves(moves, layer_z_map)
-        B = _layer_stats_from_moves(compare_moves, compare_layer_z_map)
+        first = compare_runs[0]
+        B = _layer_stats_from_moves(first["moves"], first["layer_z_map"])
         all_layers = sorted(set(A.keys()) | set(B.keys()))
         for Lx in all_layers:
             a = A.get(Lx, {})
@@ -892,33 +1019,49 @@ def write_xlsx(
         set_basic_column_widths(ws_cb, {"A": 8, "B": 12, "C": 12, "D": 12, "E": 12, "F": 12, "G": 12, "H": 12, "I": 12, "J": 12, "K": 12})
 
         ws_cs = wb.create_sheet("Compare_Summary")
-        ws_cs.append(["Metric", "A", (compare_label or "B"), "Delta (B-A)"])
+        header = ["Metric", "A"]
+        for r in compare_runs:
+            header.extend([r.get("label") or Path(r.get("path","B")).stem, "Delta"])
+        ws_cs.append(header)
 
         def _sum_or_none(d, key):
             vals = [v.get(key) for v in d.values() if v.get(key) is not None]
             return sum(vals) if vals else None
 
-        # Totals
+        def _metric_row(label, aval, bvals):
+            row = [label, aval]
+            for bv in bvals:
+                row.append(bv)
+                if aval is not None and bv is not None:
+                    row.append(bv - aval)
+                else:
+                    row.append(None)
+            return row
+
+        # Totals and maxima for each compare
         total_a = _sum_or_none(A, "time_s")
-        total_b = _sum_or_none(B, "time_s")
-        ws_cs.append(["Total time (s)", total_a, total_b, (total_b - total_a) if total_a is not None and total_b is not None else None])
-        ws_cs.append(["Max peak flow (mm³/s)",
-                      max((v.get("peak_flow") or 0) for v in A.values()) if A else None,
-                      max((v.get("peak_flow") or 0) for v in B.values()) if B else None,
-                      None])
-        ws_cs.append(["Max P95 flow (mm³/s)",
-                      max((v.get("p95_flow") or 0) for v in A.values()) if A else None,
-                      max((v.get("p95_flow") or 0) for v in B.values()) if B else None,
-                      None])
-        ws_cs.append(["Max peak speed (mm/s)",
-                      max((v.get("peak_speed") or 0) for v in A.values()) if A else None,
-                      max((v.get("peak_speed") or 0) for v in B.values()) if B else None,
-                      None])
-        ws_cs.append(["Max P95 speed (mm/s)",
-                      max((v.get("p95_speed") or 0) for v in A.values()) if A else None,
-                      max((v.get("p95_speed") or 0) for v in B.values()) if B else None,
-                      None])
-        set_basic_column_widths(ws_cs, {"A": 26, "B": 14, "C": 14, "D": 14})
+        b_dicts = [_layer_stats_from_moves(r["moves"], r["layer_z_map"]) for r in compare_runs]
+        totals_b = [_sum_or_none(d, "time_s") for d in b_dicts]
+        ws_cs.append(_metric_row("Total time (s)", total_a, totals_b))
+
+        def _max_key(d, key):
+            if not d:
+                return None
+            return max((v.get(key) or 0) for v in d.values())
+
+        ws_cs.append(_metric_row("Max peak flow (mm³/s)", _max_key(A, "peak_flow"), [_max_key(d, "peak_flow") for d in b_dicts]))
+        ws_cs.append(_metric_row("Max P95 flow (mm³/s)", _max_key(A, "p95_flow"), [_max_key(d, "p95_flow") for d in b_dicts]))
+        ws_cs.append(_metric_row("Max peak speed (mm/s)", _max_key(A, "peak_speed"), [_max_key(d, "peak_speed") for d in b_dicts]))
+        ws_cs.append(_metric_row("Max P95 speed (mm/s)", _max_key(A, "p95_speed"), [_max_key(d, "p95_speed") for d in b_dicts]))
+
+        # Widths
+        widths = {"A": 26, "B": 14}
+        col = 3
+        for _ in compare_runs:
+            widths[get_column_letter(col)] = 14
+            widths[get_column_letter(col + 1)] = 10
+            col += 2
+        set_basic_column_widths(ws_cs, widths)
 
         # Overlay charts on dashboard (comparison-focused)
         # Place them below the existing charts.
@@ -946,4 +1089,208 @@ def write_xlsx(
 
     _status("Saving workbook")
     wb.save(out_path)
+
+
+def _aggregate_layers_for_export(moves, layer_z_map, config_info=None):
+    """Return list of dict rows matching the Layers sheet schema (subset).
+
+    This is used for CSV/JSON sidecars and tests. Keep it lightweight and stable.
+    """
+    by_layer = defaultdict(list)
+    for m in moves:
+        by_layer[m["layer"]].append(m)
+
+    prev_z = None
+    out = []
+    for L in sorted(by_layer.keys()):
+        ms = by_layer[L]
+        z_val = layer_z_map.get(L, ms[-1].get("z"))
+        layer_h = (z_val - prev_z) if (prev_z is not None and z_val is not None) else None
+        if z_val is not None:
+            prev_z = z_val
+
+        t = sum(m.get("time_s") or 0.0 for m in ms)
+        d = sum(m.get("dist_mm") or 0.0 for m in ms)
+        e_pos = sum((m.get("de_mm") or 0.0) for m in ms if (m.get("de_mm") or 0.0) > 0.0)
+
+        sp_vals = [m["speed_mm_s"] for m in ms if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0.0) > 0.0]
+        sp_w = [m.get("time_s") or 0.0 for m in ms if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0.0) > 0.0]
+        fl_vals = [m["flow_mm3_s"] for m in ms if (m.get("flow_mm3_s") or 0.0) > 0.0]
+        fl_w = [m.get("time_s") or 0.0 for m in ms if (m.get("flow_mm3_s") or 0.0) > 0.0]
+
+        peak_speed = max(sp_vals) if sp_vals else None
+        p95_speed = weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None
+        p99_speed = weighted_quantile(sp_vals, sp_w, 0.99) if sp_vals else None
+        peak_flow = max(fl_vals) if fl_vals else None
+        p95_flow = weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None
+        p99_flow = weighted_quantile(fl_vals, fl_w, 0.99) if fl_vals else None
+
+        flow_limit = (config_info or {}).get("filament_max_volumetric_speed")
+        speed_limit = (config_info or {}).get("max_print_speed")
+        flow_headroom = None
+        speed_headroom = None
+        try:
+            if flow_limit is not None and p99_flow is not None:
+                flow_headroom = float(flow_limit) - float(p99_flow)
+        except Exception:
+            pass
+        try:
+            if speed_limit is not None and p99_speed is not None:
+                speed_headroom = float(speed_limit) - float(p99_speed)
+        except Exception:
+            pass
+
+        travel_time = sum(m.get("time_s") or 0.0 for m in ms if (m.get("de_mm") or 0.0) == 0.0 and (m.get("dist_mm") or 0.0) > 0.0)
+        travel_dist = sum(m.get("dist_mm") or 0.0 for m in ms if (m.get("de_mm") or 0.0) == 0.0 and (m.get("dist_mm") or 0.0) > 0.0)
+        extrude_time = sum(m.get("time_s") or 0.0 for m in ms if (m.get("de_mm") or 0.0) > 0.0 and (m.get("time_s") or 0.0) > 0.0)
+        retract_moves = [m for m in ms if (m.get("de_mm") or 0.0) < 0.0]
+        retract_count = len(retract_moves)
+        retract_mm = -sum(m.get("de_mm") or 0.0 for m in retract_moves)
+
+        short_fast = 0
+        for m in ms:
+            if (m.get("de_mm") or 0.0) > 0.0 and (m.get("dist_mm") or 0.0) > 0.0:
+                if (m.get("dist_mm") or 0.0) < 0.6 and (m.get("speed_mm_s") or 0.0) > 50.0:
+                    short_fast += 1
+
+        avg_speed = (d / t) if t > 0 else None
+        avg_flow = (sum((m.get("flow_mm3_s") or 0.0) * (m.get("time_s") or 0.0) for m in ms) / t) if t > 0 else None
+
+        out.append(
+            {
+                "layer": L,
+                "z_mm": z_val,
+                "layer_height_mm": layer_h,
+                "time_s": t,
+                "dist_mm": d,
+                "extrusion_mm": e_pos,
+                "avg_speed_mm_s": avg_speed,
+                "avg_flow_mm3_s": avg_flow,
+                "peak_speed_mm_s": peak_speed,
+                "p95_speed_mm_s": p95_speed,
+                "p99_speed_mm_s": p99_speed,
+                "peak_flow_mm3_s": peak_flow,
+                "p95_flow_mm3_s": p95_flow,
+                "p99_flow_mm3_s": p99_flow,
+                "flow_headroom_p99_mm3_s": flow_headroom,
+                "speed_headroom_p99_mm_s": speed_headroom,
+                "travel_time_s": travel_time,
+                "travel_dist_mm": travel_dist,
+                "extrude_time_s": extrude_time,
+                "retract_count": retract_count,
+                "retract_mm": retract_mm,
+                "dynamics_score": short_fast,
+            }
+        )
+
+    return out
+
+
+def build_json_summary(moves, layer_z_map, config_info=None):
+    """Build a small, regression-friendly summary object."""
+    layers = _aggregate_layers_for_export(moves, layer_z_map, config_info=config_info)
+    total_time_s = sum(r["time_s"] for r in layers)
+    total_travel_time_s = sum(r["travel_time_s"] for r in layers)
+    total_extrude_time_s = sum(r["extrude_time_s"] for r in layers)
+    total_retracts = sum(r["retract_count"] for r in layers)
+    total_retract_mm = sum(r["retract_mm"] for r in layers)
+
+    def _max_of(key):
+        vals = [r.get(key) for r in layers if r.get(key) is not None]
+        return max(vals) if vals else None
+
+    return {
+        "layers": len(layers),
+        "total_time_s": total_time_s,
+        "total_travel_time_s": total_travel_time_s,
+        "total_extrude_time_s": total_extrude_time_s,
+        "total_retract_count": total_retracts,
+        "total_retract_mm": total_retract_mm,
+        "max_peak_speed_mm_s": _max_of("peak_speed_mm_s"),
+        "max_p95_speed_mm_s": _max_of("p95_speed_mm_s"),
+        "max_p99_speed_mm_s": _max_of("p99_speed_mm_s"),
+        "max_peak_flow_mm3_s": _max_of("peak_flow_mm3_s"),
+        "max_p95_flow_mm3_s": _max_of("p95_flow_mm3_s"),
+        "max_p99_flow_mm3_s": _max_of("p99_flow_mm3_s"),
+        "config": {
+            "max_print_speed": (config_info or {}).get("max_print_speed"),
+            "filament_max_volumetric_speed": (config_info or {}).get("filament_max_volumetric_speed"),
+        },
+    }
+
+
+def write_csv_exports(moves, layer_z_map, out_xlsx_path: str, config_info=None, top_n_segments: int = 200):
+    """Write CSV exports next to the XLSX (layers + top segments + feature histogram)."""
+    import csv
+
+    out_xlsx = Path(out_xlsx_path)
+    base = out_xlsx.with_suffix("")
+
+    # Layers
+    layers = _aggregate_layers_for_export(moves, layer_z_map, config_info=config_info)
+    layers_path = base.with_name(base.name + "_layers.csv")
+    if layers:
+        with open(layers_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(layers[0].keys()))
+            w.writeheader()
+            w.writerows(layers)
+
+    # Top flow segments
+    segs = [m for m in moves if (m.get("de_mm") or 0.0) > 0.0 and (m.get("time_s") or 0.0) > 0.0 and (m.get("flow_mm3_s") or 0.0) > 0.0]
+    segs.sort(key=lambda m: (m.get("flow_mm3_s") or 0.0), reverse=True)
+    seg_path = base.with_name(base.name + "_top_flow_segments.csv")
+    with open(seg_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "rank", "layer", "type", "z_mm", "x0", "y0", "x1", "y1", "dist_mm", "de_mm", "time_s", "speed_mm_s", "flow_mm3_s"
+        ]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for idx, m in enumerate(segs[:max(1, int(top_n_segments))], start=1):
+            w.writerow(
+                {
+                    "rank": idx,
+                    "layer": m.get("layer"),
+                    "type": m.get("type"),
+                    "z_mm": m.get("z"),
+                    "x0": m.get("x0"),
+                    "y0": m.get("y0"),
+                    "x1": m.get("x1"),
+                    "y1": m.get("y1"),
+                    "dist_mm": m.get("dist_mm"),
+                    "de_mm": m.get("de_mm"),
+                    "time_s": m.get("time_s"),
+                    "speed_mm_s": m.get("speed_mm_s"),
+                    "flow_mm3_s": m.get("flow_mm3_s"),
+                }
+            )
+
+    # Feature histogram
+    fh_path = base.with_name(base.name + "_feature_flow_hist.csv")
+    flow_values = [m.get("flow_mm3_s") for m in segs]
+    if flow_values:
+        lo = 0.0
+        hi = max(flow_values)
+        if (config_info or {}).get("filament_max_volumetric_speed") is not None:
+            try:
+                hi = max(hi, float((config_info or {}).get("filament_max_volumetric_speed")))
+            except Exception:
+                pass
+        bins_spec = make_bins(lo, hi, 20)
+        total_time = sum(m.get("time_s") or 0.0 for m in segs)
+        by_type = defaultdict(list)
+        for m in segs:
+            by_type[m.get("type") or "UNKNOWN"].append(m)
+        rows = []
+        for t, ms in sorted(by_type.items(), key=lambda kv: sum(m.get("time_s") or 0.0 for m in kv[1]), reverse=True):
+            for (b_lo, b_hi) in bins_spec:
+                bt = 0.0
+                for m in ms:
+                    v = m.get("flow_mm3_s") or 0.0
+                    if b_lo <= v < b_hi or (b_hi == bins_spec[-1][1] and b_lo <= v <= b_hi):
+                        bt += m.get("time_s") or 0.0
+                rows.append({"type": t, "bin_lo": b_lo, "bin_hi": b_hi, "time_s": bt, "time_pct": (bt / total_time) if total_time > 0 else None})
+        with open(fh_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["type", "bin_lo", "bin_hi", "time_s", "time_pct"])
+            w.writeheader()
+            w.writerows(rows)
 

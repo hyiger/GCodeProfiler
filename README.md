@@ -34,7 +34,7 @@ Convert **PrusaSlicer ASCII `.gcode`** into an **Excel workbook (`.xlsx`)** with
 - **Top_Flow_Segments**
   - top-N extrusion segments ranked by volumetric flow (spike hunting)
 
-- **Hist_Flow_ByFeature**
+- **FeatureFlow_Hist**
   - per-feature **time-weighted** flow histogram (which feature is pushing flow limits?)
 
 - **Top_Slowest_Layers**
@@ -95,7 +95,7 @@ python gcode_profiler.py print.gcode   --bins 12   --filament-diameter 1.75   --
 Flags:
 
 - `--output out.xlsx` : override output path
-- `--compare other.gcode` : compare two G-code files (adds `Compare_*` sheets and overlay charts)
+- `--compare other.gcode [more.gcode ...]` : compare against one or more other files (adds `Compare_*` sheets and overlay charts for the first compare)
 - `--config config.ini` : optional PrusaSlicer config.ini (key=value) to improve defaults and chart scaling
 - `--bins N` : number of legend bins used for histograms
 - `--filament-diameter D` : filament diameter (mm) used for volumetric flow
@@ -104,6 +104,11 @@ Flags:
 - `--per-layer-only` : skip per-move rows for smaller files
 - `--top-n-slowest N` : how many slowest layers to list and chart
 - `--layout compact|wide` : dashboard layout (compact packs charts tighter; wide uses larger charts/spacing)
+- `--top-n-segments N` : how many top flow segments to include in `Top_Flow_Segments` (default: 200)
+- `--csv` : write sidecar CSV exports next to the xlsx (layers + top flow segments + feature flow histogram)
+- `--json-summary` : write a small JSON summary next to the xlsx (useful for regression tests)
+- `--no-manifest` : disable writing the `.run.json` manifest next to the xlsx
+- `--status-interval N` : print a status line every N parsed lines (default: 250000)
 - `--quiet` : suppress progress output
 
 ### Progress output
@@ -120,6 +125,14 @@ By default, the tool prints lightweight progress messages to the terminal (stder
 ```
 
 Use `--quiet` to disable these messages.
+
+### Run manifest
+
+By default, GCodeProfiler also writes a small JSON manifest next to the workbook:
+
+- `print.run.json`
+
+It includes input paths, CLI arguments, a timestamp, and SHA256 hashes (handy for provenance and CI artifacts). Disable with `--no-manifest`.
 
 ## Testing
 
@@ -149,7 +162,21 @@ Output (default):
 Additional sheets:
 
 - `Compare_Layers`: A/B layer-aligned metrics (time, peak/p95 speed/flow)
-- `Compare_Summary`: headline differences
+- `Compare_Summary`: headline differences (includes all compare files)
+
+### CSV / JSON sidecars
+
+If you pass `--csv`, the tool will write:
+
+- `*_layers.csv`
+- `*_top_flow_segments.csv`
+- `*_feature_flow_hist.csv`
+
+If you pass `--json-summary`, the tool will write:
+
+- `*.summary.json`
+
+By default, the tool also writes a `*.run.json` manifest with SHA-256 hashes of inputs and outputs (disable with `--no-manifest`).
 ### Using PrusaSlicer `config.ini` (optional)
 
 You can pass a PrusaSlicer-exported `config.ini` to make the workbook **more comparable to what you see in PrusaSlicer**:
