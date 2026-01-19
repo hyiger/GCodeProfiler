@@ -105,6 +105,7 @@ Flags:
 - `--top-n-slowest N` : how many slowest layers to list and chart
 - `--layout compact|wide` : dashboard layout (compact packs charts tighter; wide uses larger charts/spacing)
 - `--top-n-segments N` : how many top flow segments to include in `Top_Flow_Segments` (default: 200)
+- `--min-peak-segment-time S` : ignore very short segments when computing per-layer “peak” speed/flow (reduces single-move spikes; default: 0.05s)
 - `--csv` : write sidecar CSV exports next to the xlsx (layers + top flow segments + feature flow histogram)
 - `--json-summary` : write a small JSON summary next to the xlsx (useful for regression tests)
 - `--no-manifest` : disable writing the `.run.json` manifest next to the xlsx
@@ -155,6 +156,13 @@ This is handy when you change one setting (nozzle, speeds, cooling, etc) and wan
 python gcode_profiler.py A.gcode --compare B.gcode
 ```
 
+If you also have the PrusaSlicer `config.ini` for each run, pass them so comparison charts can draw **per-run limit** reference
+lines (e.g. max volumetric flow, max print speed):
+
+```bash
+python gcode_profiler.py A.gcode --config A.ini --compare B.gcode --compare-config B.ini
+```
+
 Output (default):
 
 - `A_vs_B.xlsx`
@@ -163,6 +171,10 @@ Additional sheets:
 
 - `Compare_Layers`: A/B layer-aligned metrics (time, peak/p95 speed/flow)
 - `Compare_Summary`: headline differences (includes all compare files)
+
+Notes:
+- Compare charts align the X axis by **Z height (mm)** so runs with different layer heights line up visually.
+- The Dashboard includes a small helper table mapping major Z ticks to **A layer** and **B layer** ("two x-axis scales").
 
 ### CSV / JSON sidecars
 
@@ -229,3 +241,7 @@ The implementation is split into a small package so it is easier to maintain:
 - `gcode_profiler/constants.py` – defaults
 
 The original `gcode_profiler.py` script remains as a thin wrapper for backwards compatibility.
+
+### Compare labels
+
+When you provide `--config` / `--compare-config`, GCodeProfiler derives descriptive series labels from the config (e.g. `HF0.6_0.20_STRUCTURAL`) and uses them in the compare chart legends instead of generic A/B.

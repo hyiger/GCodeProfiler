@@ -42,6 +42,8 @@ def write_xlsx(
     filament_density_g_cm3: float,
     config_info: dict | None = None,
     layout: str = "compact",
+    run_label: str = "A",
+    min_peak_segment_time_s: float = 0.05,
     compare_runs: list | None = None,
     top_n_segments: int = 200,
     status_cb=None,
@@ -543,11 +545,22 @@ def write_xlsx(
             sp_w = [m["time_s"] for m in ms if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
             fl_vals = [m["flow_mm3_s"] for m in ms if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
             fl_w = [m["time_s"] for m in ms if m.get("flow_mm3_s") is not None and (m.get("flow_mm3_s") or 0) > 0]
-
-            peak_speed = max(sp_vals) if sp_vals else None
             p95_speed = weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None
-            peak_flow = max(fl_vals) if fl_vals else None
+            p99_speed = weighted_quantile(sp_vals, sp_w, 0.99) if sp_vals else None
+            peak_speed_raw = max(sp_vals) if sp_vals else None
+            # Spike suppression: cap extreme peaks to a high percentile when they look like single-segment noise.
+            if peak_speed_raw is not None and p99_speed is not None and peak_speed_raw > 1.5 * p99_speed:
+                peak_speed = p99_speed
+            else:
+                peak_speed = peak_speed_raw
+
             p95_flow = weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None
+            p99_flow = weighted_quantile(fl_vals, fl_w, 0.99) if fl_vals else None
+            peak_flow_raw = max(fl_vals) if fl_vals else None
+            if peak_flow_raw is not None and p99_flow is not None and peak_flow_raw > 1.5 * p99_flow:
+                peak_flow = p99_flow
+            else:
+                peak_flow = peak_flow_raw
 
             over_flow_pct = None
             over_speed_pct = None
@@ -1059,9 +1072,9 @@ def write_xlsx(
         ws_cb = wb.create_sheet("Compare_Layers")
 
         def _layer_stats_series(moves_x, layer_z_x):
-            """Return per-layer stats as a list of rows sorted by Z.
+            """Return per-layer stats as a list of dicts sorted by Z.
 
-            Each element: (z, layer, time_s, peak_flow, p95_flow, peak_speed, p95_speed)
+            Keys: z, layer, time_s, peak_flow, p95_flow, peak_speed, p95_speed
             """
             by = defaultdict(list)
             for m in moves_x:
@@ -1071,55 +1084,138 @@ def write_xlsx(
             for Lx, msx in by.items():
                 z = layer_z_x.get(Lx)
                 if z is None:
-                    # Fall back to last Z we saw in that layer
                     z = msx[-1].get("z")
 
                 t = sum(m.get("time_s", 0.0) or 0.0 for m in msx)
+
                 sp_vals = [m["speed_mm_s"] for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
                 sp_w = [m.get("time_s") or 0.0 for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0]
+
                 fl_vals = [m["flow_mm3_s"] for m in msx if (m.get("flow_mm3_s") or 0.0) > 0.0]
                 fl_w = [m.get("time_s") or 0.0 for m in msx if (m.get("flow_mm3_s") or 0.0) > 0.0]
 
-                peak_speed = max(sp_vals) if sp_vals else None
-                p95_speed = weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None
-                peak_flow = max(fl_vals) if fl_vals else None
-                p95_flow = weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None
-                rows.append((z, Lx, t, peak_flow, p95_flow, peak_speed, p95_speed))
+                # Filtered peaks to reduce single-move spike noise: ignore segments shorter than min_peak_segment_time_s
+                sp_vals_f = [m["speed_mm_s"] for m in msx if m.get("speed_mm_s") is not None and (m.get("dist_mm") or 0) > 0 and (m.get("time_s") or 0.0) >= min_peak_segment_time_s]
+                fl_vals_f = [m["flow_mm3_s"] for m in msx if (m.get("flow_mm3_s") or 0.0) > 0.0 and (m.get("time_s") or 0.0) >= min_peak_segment_time_s]
 
-            # Sort by Z (None last)
-            rows.sort(key=lambda r: (float("inf") if r[0] is None else r[0]))
+                peak_speed = max(sp_vals_f) if sp_vals_f else (max(sp_vals) if sp_vals else None)
+                p95_speed = weighted_quantile(sp_vals, sp_w, 0.95) if sp_vals else None
+                peak_flow = max(fl_vals_f) if fl_vals_f else (max(fl_vals) if fl_vals else None)
+                p95_flow = weighted_quantile(fl_vals, fl_w, 0.95) if fl_vals else None
+
+                rows.append({
+                    "z": z,
+                    "layer": Lx,
+                    "time_s": t,
+                    "peak_flow": peak_flow,
+                    "p95_flow": p95_flow,
+                    "peak_speed": peak_speed,
+                    "p95_speed": p95_speed,
+                })
+
+            rows.sort(key=lambda r: (float('inf') if r["z"] is None else r["z"]))
             return rows
 
-        # A is the primary run
-        A_rows = _layer_stats_series(moves, layer_z_map)
-        # B is the first compare run for overlay charts
+        def _interp_by_z(rows, z_query):
+            """Linear interpolation of a metric over Z.
+
+            For per-layer series, we treat the value at each layer's Z and interpolate between adjacent Zs.
+            If z_query is outside the known range, returns None.
+            """
+            pts = [(r["z"], r) for r in rows if r.get("z") is not None]
+            if not pts:
+                return None
+            zs = [z for z, _ in pts]
+            if z_query < zs[0] or z_query > zs[-1]:
+                return None
+            # exact match
+            for z, rr in pts:
+                if z == z_query:
+                    return rr
+            # find neighbors
+            lo_i = 0
+            hi_i = len(pts) - 1
+            # binary search for insertion point
+            import bisect
+            idx = bisect.bisect_left(zs, z_query)
+            if idx <= 0:
+                return pts[0][1]
+            if idx >= len(pts):
+                return pts[-1][1]
+            z0, r0 = pts[idx - 1]
+            z1, r1 = pts[idx]
+            if z1 == z0:
+                return r1
+            t = (z_query - z0) / (z1 - z0)
+            out = {"z": z_query}
+            # interpolate numeric keys
+            for k in ("time_s", "peak_flow", "p95_flow", "peak_speed", "p95_speed"):
+                v0 = r0.get(k)
+                v1 = r1.get(k)
+                if v0 is None or v1 is None:
+                    out[k] = None
+                else:
+                    out[k] = (1 - t) * float(v0) + t * float(v1)
+            # layer number: nearest by Z
+            out["layer"] = r0.get("layer") if (z_query - z0) <= (z1 - z_query) else r1.get("layer")
+            return out
+
+        # Build Z-aligned comparison for the first compare run (overlay charts).
         first = compare_runs[0]
+        A_label = run_label or "A"
+        B_label = (first.get("label") or "B")
+
+        a_cfg = config_info or {}
+        b_cfg = first.get("config_info") or {}
+
+        def _to_float(v):
+            try:
+                return float(v) if v is not None else None
+            except Exception:
+                return None
+
+        flow_lim_a = _to_float(a_cfg.get("filament_max_volumetric_speed"))
+        flow_lim_b = _to_float(b_cfg.get("filament_max_volumetric_speed"))
+        sp_lim_a = _to_float(a_cfg.get("max_print_speed"))
+        sp_lim_b = _to_float(b_cfg.get("max_print_speed"))
+
+        A_rows = _layer_stats_series(moves, layer_z_map)
         B_rows = _layer_stats_series(first["moves"], first["layer_z_map"])
 
+        zA = [r["z"] for r in A_rows if r.get("z") is not None]
+        zB = [r["z"] for r in B_rows if r.get("z") is not None]
+        z_common = sorted(set(zA) | set(zB))
+
         ws_cb.append([
-            "A_z_mm", "A_layer", "A_time_s", "A_peak_flow", "A_p95_flow", "A_peak_speed", "A_p95_speed",
-            "B_z_mm", "B_layer", "B_time_s", "B_peak_flow", "B_p95_flow", "B_peak_speed", "B_p95_speed",
+            "Z_mm",
+            f"{A_label}_layer", f"{A_label}_time_s", f"{A_label}_peak_flow", f"{A_label}_p95_flow", f"{A_label}_peak_speed",
+            f"{B_label}_layer", f"{B_label}_time_s", f"{B_label}_peak_flow", f"{B_label}_p95_flow", f"{B_label}_peak_speed",
+            f"{A_label}_limit_y", f"{B_label}_limit_y",
         ])
 
-        n = max(len(A_rows), len(B_rows))
-        for i in range(n):
-            a = A_rows[i] if i < len(A_rows) else (None, None, None, None, None, None, None)
-            b = B_rows[i] if i < len(B_rows) else (None, None, None, None, None, None, None)
+        # Fill data rows
+        for z in z_common:
+            a = _interp_by_z(A_rows, z)
+            b = _interp_by_z(B_rows, z)
             ws_cb.append([
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6],
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6],
+                z,
+                a.get("layer") if a else None, a.get("time_s") if a else None, a.get("peak_flow") if a else None, a.get("p95_flow") if a else None, a.get("peak_speed") if a else None,
+                b.get("layer") if b else None, b.get("time_s") if b else None, b.get("peak_flow") if b else None, b.get("p95_flow") if b else None, b.get("peak_speed") if b else None,
+                None, None,
             ])
 
+        data_end_row = ws_cb.max_row
+
+        # Column widths
         set_basic_column_widths(
             ws_cb,
             {
-                "A": 10, "B": 8, "C": 12, "D": 12, "E": 12, "F": 12, "G": 12,
-                "H": 10, "I": 8, "J": 12, "K": 12, "L": 12, "M": 12, "N": 12,
+                "A": 10,"B": 9,"C": 12,"D": 12,"E": 12,"F": 12,"G": 9,"H": 12,"I": 12,"J": 12,"K": 12,"L": 12,"M": 12,
             },
         )
 
         ws_cs = wb.create_sheet("Compare_Summary")
-        header = ["Metric", "A"]
+        header = ["Metric", (run_label or "A")]
         for r in compare_runs:
             header.extend([r.get("label") or Path(r.get("path","B")).stem, "Delta"])
         ws_cs.append(header)
@@ -1218,17 +1314,21 @@ def write_xlsx(
                 nice = 10
             return nice * (10 ** exp)
 
-        # Determine X axis range from both runs' Z
+        # Determine X axis range from Z (common axis)
         max_z = None
-        for col in (1, 8):
-            vals = [r[0] for r in ws_cb.iter_rows(min_row=2, min_col=col, max_col=col, values_only=True) if r[0] is not None]
-            if vals:
-                mz = max(vals)
-                max_z = mz if max_z is None else max(max_z, mz)
+        try:
+            vals = [r[0] for r in ws_cb.iter_rows(min_row=2, min_col=1, max_col=1, values_only=True) if r[0] is not None]
+            max_z = max(vals) if vals else None
+        except Exception:
+            max_z = None
 
         major = _nice_major_unit(max_z, target_ticks=7)
 
-        def _add_compare_scatter(title, y_title, col_ax, col_ay, col_bx, col_by, anchor):
+        # We keep helper points below the data table so charts can reference 2-point constant limit lines
+        helper_row = (data_end_row or ws_cb.max_row) + 2
+
+        def _add_compare_scatter(title, y_title, col_ay, col_by, anchor, limit_a=None, limit_b=None):
+            nonlocal helper_row
             ch = ScatterChart()
             ch.title = title
             ch.y_axis.title = y_title
@@ -1245,28 +1345,95 @@ def write_xlsx(
             if major is not None:
                 ch.x_axis.majorUnit = major
 
+            # Common X for both series
+            x_ref = Reference(ws_cb, min_col=1, min_row=2, max_row=data_end_row)
+
             # A series
-            x_a = Reference(ws_cb, min_col=col_ax, min_row=2, max_row=ws_cb.max_row)
-            y_a = Reference(ws_cb, min_col=col_ay, min_row=1, max_row=ws_cb.max_row)
-            s_a = Series(y_a, x_a, title_from_data=True)
+            y_a = Reference(ws_cb, min_col=col_ay, min_row=1, max_row=data_end_row)
+            s_a = Series(y_a, x_ref, title_from_data=True)
             ch.series.append(s_a)
 
             # B series
-            x_b = Reference(ws_cb, min_col=col_bx, min_row=2, max_row=ws_cb.max_row)
-            y_b = Reference(ws_cb, min_col=col_by, min_row=1, max_row=ws_cb.max_row)
-            s_b = Series(y_b, x_b, title_from_data=True)
+            y_b = Reference(ws_cb, min_col=col_by, min_row=1, max_row=data_end_row)
+            s_b = Series(y_b, x_ref, title_from_data=True)
             ch.series.append(s_b)
 
+            # Optional per-run limit reference lines (2-point scatter)
+            if limit_a is not None:
+                ws_cb.cell(row=helper_row, column=1, value=0.0)
+                ws_cb.cell(row=helper_row+1, column=1, value=max_z)
+                ws_cb.cell(row=helper_row, column=12, value=float(limit_a))
+                ws_cb.cell(row=helper_row+1, column=12, value=float(limit_a))
+                y_lim_a = Reference(ws_cb, min_col=12, min_row=helper_row, max_row=helper_row+1)
+                x_lim = Reference(ws_cb, min_col=1, min_row=helper_row, max_row=helper_row+1)
+                s_la = Series(y_lim_a, x_lim, title=f"{A_label}_limit")
+                ch.series.append(s_la)
+
+            if limit_b is not None:
+                ws_cb.cell(row=helper_row, column=13, value=float(limit_b))
+                ws_cb.cell(row=helper_row+1, column=13, value=float(limit_b))
+                y_lim_b = Reference(ws_cb, min_col=13, min_row=helper_row, max_row=helper_row+1)
+                x_lim = Reference(ws_cb, min_col=1, min_row=helper_row, max_row=helper_row+1)
+                s_lb = Series(y_lim_b, x_lim, title=f"{B_label}_limit")
+                ch.series.append(s_lb)
+
+            helper_row += 3
+
+            # Layout
+            ch.legend.position = "r"
             ch.height = CH_H
             ch.width = CH_W
             ws_dash.add_chart(ch, anchor)
 
-        # Columns: A_z(1) A_time(3) A_peak_flow(4) A_p95_flow(5) A_peak_speed(6)
-        #          B_z(8) B_time(10) B_peak_flow(11) B_p95_flow(12) B_peak_speed(13)
-        _add_compare_scatter("Compare: Layer Time (s)", "seconds", 1, 3, 8, 10, f"{LEFT}{compare_r1}")
-        _add_compare_scatter("Compare: Peak Flow (mm³/s)", "mm³/s", 1, 4, 8, 11, f"{RIGHT}{compare_r1}")
-        _add_compare_scatter("Compare: P95 Flow (mm³/s)", "mm³/s", 1, 5, 8, 12, f"{LEFT}{compare_r2}")
-        _add_compare_scatter("Compare: Peak Speed (mm/s)", "mm/s", 1, 6, 8, 13, f"{RIGHT}{compare_r2}")
+        _add_compare_scatter("Compare: Layer Time (s)", "seconds", 3, 8, f"{LEFT}{compare_r1}")
+        _add_compare_scatter("Compare: Peak Flow (mm³/s)", "mm³/s", 4, 9, f"{RIGHT}{compare_r1}", limit_a=flow_lim_a, limit_b=flow_lim_b)
+        _add_compare_scatter("Compare: P95 Flow (mm³/s)", "mm³/s", 5, 10, f"{LEFT}{compare_r2}", limit_a=flow_lim_a, limit_b=flow_lim_b)
+        _add_compare_scatter("Compare: Peak Speed (mm/s)", "mm/s", 6, 11, f"{RIGHT}{compare_r2}", limit_a=sp_lim_a, limit_b=sp_lim_b)
+
+        # "Two x-axis scales" helper table (Z -> A layer, B layer) for major tick positions.
+        try:
+            if major is None:
+                major_local = _nice_major_unit(max_z, target_ticks=7)
+            else:
+                major_local = major
+            if major_local and max_z is not None:
+                def _nearest_layer(rows, z_target):
+                    best = None
+                    for rr in rows:
+                        z = rr.get("z") if isinstance(rr, dict) else None
+                        layer = rr.get("layer") if isinstance(rr, dict) else None
+                        if z is None:
+                            continue
+                        dz = abs(float(z) - float(z_target))
+                        if best is None or dz < best[0]:
+                            best = (dz, layer)
+                    return best[1] if best else None
+
+                ticks = []
+                zt = 0.0
+                while zt <= float(max_z) + 1e-9:
+                    ticks.append(round(zt, 6))
+                    zt += float(major_local)
+
+                table_row = compare_r2 + int(CH_H * 2) + 3
+                ws_dash[f"{LEFT}{table_row}"] = "Compare X-axis scales (by Z tick)"
+                ws_dash[f"{LEFT}{table_row}"].alignment = Alignment(horizontal="left")
+                ws_dash[f"{LEFT}{table_row+1}"] = "Z (mm)"
+                ws_dash[f"{LEFT}{table_row+1}"].alignment = Alignment(horizontal="left")
+                ws_dash[f"{LEFT}{table_row+1}"].fill = PatternFill("solid", fgColor="DDDDDD")
+                ws_dash[f"{MIDDLE}{table_row+1}"] = "A layer"
+                ws_dash[f"{MIDDLE}{table_row+1}"].fill = PatternFill("solid", fgColor="DDDDDD")
+                ws_dash[f"{RIGHT}{table_row+1}"] = "B layer"
+                ws_dash[f"{RIGHT}{table_row+1}"].fill = PatternFill("solid", fgColor="DDDDDD")
+
+                r = table_row + 2
+                for ztick in ticks[:20]:  # keep it compact
+                    ws_dash[f"{LEFT}{r}"] = ztick
+                    ws_dash[f"{MIDDLE}{r}"] = _nearest_layer(A_rows, ztick)
+                    ws_dash[f"{RIGHT}{r}"] = _nearest_layer(B_rows, ztick)
+                    r += 1
+        except Exception:
+            pass
 
     _status("Saving workbook")
     wb.save(out_path)
